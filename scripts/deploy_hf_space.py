@@ -7,6 +7,7 @@ import argparse
 import os
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 from huggingface_hub import HfApi
 
@@ -31,6 +32,15 @@ def parse_args() -> argparse.Namespace:
         "--space-id",
         default=os.getenv("HF_SPACE_ID", ""),
         help="Space id in the form '<owner>/<space-name>' (or set HF_SPACE_ID).",
+    )
+    parser.add_argument(
+        "--space-url",
+        default=os.getenv("HF_SPACE_PAGE_URL", ""),
+        help=(
+            "Optional Space page URL like "
+            "'https://huggingface.co/spaces/<owner>/<space-name>' "
+            "(or set HF_SPACE_PAGE_URL)."
+        ),
     )
     parser.add_argument(
         "--repo-dir",
@@ -86,11 +96,38 @@ def set_required_space_secrets(api: HfApi, space_id: str, pairs: Iterable[tuple[
         print(f"[OK] Set Space secret: {key}")
 
 
+def parse_space_id_from_page_url(space_url: str) -> str | None:
+    parsed = urlparse(space_url.strip())
+    if parsed.netloc != "huggingface.co":
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 3 or parts[0] != "spaces":
+        return None
+    return f"{parts[1]}/{parts[2]}"
+
+
+def resolve_space_id(space_id: str, space_url: str) -> str:
+    if space_id and "/" in space_id:
+        return space_id
+    parsed = parse_space_id_from_page_url(space_url) if space_url else None
+    if parsed:
+        return parsed
+    raise SystemExit(
+        "HF space id missing/invalid. Use --space-id <owner>/<space-name>, "
+        "set HF_SPACE_ID, or pass --space-url https://huggingface.co/spaces/<owner>/<space-name>."
+    )
+
+
+def to_runtime_space_url(space_id: str) -> str:
+    owner, name = space_id.split("/", 1)
+    normalized_name = name.replace("_", "-")
+    return f"https://{owner}-{normalized_name}.hf.space"
+
+
 def main() -> int:
     args = parse_args()
 
-    if not args.space_id or "/" not in args.space_id:
-        raise SystemExit("HF space id missing/invalid. Use --space-id <owner>/<space-name> or set HF_SPACE_ID.")
+    space_id = resolve_space_id(args.space_id, args.space_url)
 
     if not is_real_value(args.token):
         raise SystemExit("HF_TOKEN is missing or looks like a placeholder.")
@@ -105,13 +142,13 @@ def main() -> int:
     print(f"[OK] Authenticated to Hugging Face as: {actor}")
 
     api.create_repo(
-        repo_id=args.space_id,
+        repo_id=space_id,
         repo_type="space",
         space_sdk="docker",
         private=args.private,
         exist_ok=True,
     )
-    print(f"[OK] Space ready: https://huggingface.co/spaces/{args.space_id}")
+    print(f"[OK] Space ready: https://huggingface.co/spaces/{space_id}")
 
     ignore_patterns = [
         ".git",
@@ -126,7 +163,7 @@ def main() -> int:
 
     commit_info = api.upload_folder(
         folder_path=str(repo_dir),
-        repo_id=args.space_id,
+        repo_id=space_id,
         repo_type="space",
         commit_message="chore: sync repository for validation",
         ignore_patterns=ignore_patterns,
@@ -142,11 +179,11 @@ def main() -> int:
                 secret_pairs.append((key, value))
 
         if secret_pairs:
-            set_required_space_secrets(api, args.space_id, secret_pairs)
+            set_required_space_secrets(api, space_id, secret_pairs)
         else:
             print("[WARN] No non-placeholder runtime variables found for Space secrets.")
 
-    space_url = f"https://{args.space_id.replace('/', '-')}.hf.space"
+    space_url = to_runtime_space_url(space_id)
     print(f"[NEXT] Ping URL: {space_url}")
     print(f"[NEXT] Run: ./scripts/validate-submission.sh {space_url} {repo_dir}")
     return 0

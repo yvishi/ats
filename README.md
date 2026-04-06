@@ -249,6 +249,8 @@ Then validate against the live Space URL:
 ./scripts/validate-submission.sh "https://<your-username>-<your-space-name>.hf.space" .
 ```
 
+If you want a token-only setup, start from [.env.hf_space.example](.env.hf_space.example), which already includes the Space id/url and runtime defaults.
+
 ## Docker
 
 Build locally:
