@@ -42,12 +42,22 @@ class Difficulty(str, Enum):
     HARD = "hard"
 
 
+DEFAULT_ALLOWED_OPERATIONS = (
+    OperationType.ARRIVAL,
+    OperationType.DEPARTURE,
+)
+
+
+def default_allowed_operations() -> List[OperationType]:
+    return list(DEFAULT_ALLOWED_OPERATIONS)
+
+
 class RunwaySpec(BaseModel):
     """Runway configuration available to the controller."""
 
     runway_id: str = Field(..., description="Runway identifier")
     allowed_operations: List[OperationType] = Field(
-        default_factory=lambda: [OperationType.ARRIVAL, OperationType.DEPARTURE],
+        default_factory=default_allowed_operations,
         description="Operations permitted on the runway",
     )
     hourly_capacity: int = Field(

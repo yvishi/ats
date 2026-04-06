@@ -18,6 +18,7 @@ try:
         PlanSnapshot,
         TaskDefinition,
         TaskGrade,
+        TaskMetrics,
     )
     from ..tasks import ordered_tasks, render_task_briefing, task_catalog
 except ImportError:
@@ -30,6 +31,7 @@ except ImportError:
         PlanSnapshot,
         TaskDefinition,
         TaskGrade,
+        TaskMetrics,
     )
     from tasks import ordered_tasks, render_task_briefing, task_catalog
 
@@ -185,7 +187,7 @@ class ATCOptimizationEnvironment(
             name="ATC Optimization OpenEnv",
             description="Realistic air traffic control disruption recovery benchmark.",
             version="1.0.0",
-            author="OpenAI Codex",
+            author="ATC Optimization OpenEnv Contributors",
             readme_content=readme_content,
         )
 
@@ -220,9 +222,7 @@ class ATCOptimizationEnvironment(
             done=done,
         )
 
-    def _build_summary(
-        self, metrics, grades: List[TaskGrade], done: bool
-    ) -> str:
+    def _build_summary(self, metrics: TaskMetrics, grades: List[TaskGrade], done: bool) -> str:
         lead_grade = next(
             (grade for grade in grades if grade.grader_name == "composite_task_grader"),
             grades[-1],

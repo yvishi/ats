@@ -86,6 +86,7 @@ The observation model is [ATCOptimizationObservation](models.py). It includes:
 - `steps_remaining`
 
 State inspection is available through [ATCOptimizationState](models.py) and exposed by `/state`.
+The state payload includes `active_task_ids` so validators and agents can enumerate all configured tasks.
 
 ## Reward design
 
