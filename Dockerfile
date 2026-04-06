@@ -17,7 +17,7 @@ RUN apt-get update \
 
 COPY pyproject.toml README.md openenv.yaml /app/
 COPY uv.lock /app/
-COPY __init__.py client.py engine.py graders.py inference.py models.py planner.py tasks.py /app/
+COPY __init__.py client.py constants.py engine.py graders.py imports.py inference.py models.py planner.py tasks.py /app/
 COPY server /app/server
 COPY scripts /app/scripts
 
