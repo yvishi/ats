@@ -44,16 +44,6 @@ except ImportError:
         MAX_DIAGNOSTICS,
         MAX_RECOMMENDATIONS,
     )
-except ImportError:
-    from constants import (
-        SEPARATION_BY_WAKE,
-        SCORE_WEIGHTS,
-        METRIC_PRECISION,
-        FUEL_PRECISION,
-        AIRLINE_DELAY_PRECISION,
-        MAX_DIAGNOSTICS,
-        MAX_RECOMMENDATIONS,
-    )
 
 # Build priority delay tolerance dynamically from models
 PRIORITY_DELAY_TOLERANCE: Dict[PriorityClass, int] = {

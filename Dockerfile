@@ -15,16 +15,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md openenv.yaml /app/
+COPY uv.lock /app/
 COPY __init__.py client.py engine.py graders.py inference.py models.py planner.py tasks.py /app/
 COPY server /app/server
 COPY scripts /app/scripts
 
-RUN pip install --no-cache-dir \
-    "fastapi>=0.128.0" \
-    "openai>=2.30.0" \
-    "openenv-core[core]>=0.2.3" \
-    "pydantic>=2.12.0" \
-    "uvicorn>=0.41.0"
+RUN pip install --no-cache-dir uv \
+    && uv sync --system --frozen
 
 EXPOSE 8000
 

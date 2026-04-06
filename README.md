@@ -35,6 +35,8 @@ The environment is spec-compliant for the current OpenEnv validator:
 - package metadata and `server` script are defined in [pyproject.toml](pyproject.toml)
 - `uv.lock` is generated for reproducible builds
 
+`python -m openenv.cli validate .` is expected to report `[OK] : Ready for multi-mode deployment`.
+
 ## Tasks
 
 Three benchmark tasks are included in [tasks.py](tasks.py):
