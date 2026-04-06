@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from statistics import pstdev
 from typing import Dict, Iterable, List, Tuple
 
+# Import models with automatic relative/absolute fallback
 try:
     from .models import (
         FlightRecord,
@@ -15,6 +16,15 @@ try:
         SlotAssignment,
         TaskDefinition,
         TaskMetrics,
+    )
+    from .constants import (
+        SEPARATION_BY_WAKE,
+        SCORE_WEIGHTS,
+        METRIC_PRECISION,
+        FUEL_PRECISION,
+        AIRLINE_DELAY_PRECISION,
+        MAX_DIAGNOSTICS,
+        MAX_RECOMMENDATIONS,
     )
 except ImportError:
     from models import (
@@ -25,20 +35,17 @@ except ImportError:
         TaskDefinition,
         TaskMetrics,
     )
+    from constants import (
+        SEPARATION_BY_WAKE,
+        SCORE_WEIGHTS,
+        METRIC_PRECISION,
+        FUEL_PRECISION,
+        AIRLINE_DELAY_PRECISION,
+        MAX_DIAGNOSTICS,
+        MAX_RECOMMENDATIONS,
+    )
 
-
-SEPARATION_BY_WAKE: Dict[Tuple[str, str], int] = {
-    ("H", "H"): 4,
-    ("H", "M"): 5,
-    ("H", "L"): 6,
-    ("M", "H"): 3,
-    ("M", "M"): 3,
-    ("M", "L"): 4,
-    ("L", "H"): 3,
-    ("L", "M"): 3,
-    ("L", "L"): 3,
-}
-
+# Build priority delay tolerance dynamically from models
 PRIORITY_DELAY_TOLERANCE: Dict[PriorityClass, int] = {
     PriorityClass.NORMAL: 35,
     PriorityClass.CONNECTION: 20,
@@ -85,12 +92,15 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     invalid_assignments = 0
 
     assignment_map: Dict[str, SlotAssignment] = {}
+    duplicate_assignments = max(0, len(assignments) - len({item.flight_id for item in assignments}))
     for assignment in assignments:
         if assignment.flight_id in assignment_map:
             diagnostics.append(
                 f"{assignment.flight_id} appears more than once; only the last assignment is used."
             )
         assignment_map[assignment.flight_id] = assignment
+    if duplicate_assignments:
+        invalid_assignments += duplicate_assignments
 
     scheduled_by_runway: Dict[str, List[Tuple[int, SlotAssignment, FlightRecord]]] = defaultdict(list)
     delays: Dict[str, int] = {}
@@ -118,6 +128,14 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
             diagnostics.append(f"Runway {assignment.runway} is not available in this task.")
             continue
 
+        runway = runways_by_id[assignment.runway]
+        if flight.operation not in runway.allowed_operations:
+            invalid_assignments += 1
+            diagnostics.append(
+                f"Runway {assignment.runway} cannot handle {flight.operation.value} operations for {flight.flight_id}."
+            )
+            continue
+
         if assignment.assigned_minute < flight.earliest_minute or assignment.assigned_minute > flight.latest_minute:
             invalid_assignments += 1
             diagnostics.append(
@@ -126,6 +144,10 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
             continue
 
         delay = _delay_for(flight, assignment.assigned_minute)
+        if assignment.hold_minutes > 0 and abs(assignment.hold_minutes - delay) > 5:
+            diagnostics.append(
+                f"{flight.flight_id} declares hold_minutes={assignment.hold_minutes}, but the actual delay is {delay}."
+            )
         delays[flight.flight_id] = delay
         per_airline_delays[flight.airline].append(delay)
         fuel_burn += delay * flight.fuel_burn_per_minute
@@ -183,7 +205,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     fuel_efficiency = max(0.0, 1.0 - (fuel_burn / task.fuel_budget))
 
     airline_averages = {
-        airline: round(sum(values) / len(values), 2)
+        airline: round(sum(values) / len(values), AIRLINE_DELAY_PRECISION)
         for airline, values in per_airline_delays.items()
         if values
     }
@@ -194,6 +216,8 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
         recommendations.append("Cover every flight in the scenario before refining the sequence.")
     if conflict_count > 0:
         recommendations.append("Increase spacing on the affected runway or move some flights to a parallel runway.")
+    if duplicate_assignments > 0:
+        recommendations.append("Avoid duplicate flight entries; submit one definitive assignment per flight.")
     if priority_violations > 0:
         recommendations.append("Pull medical, emergency, and connection-sensitive flights closer to the front of the sequence.")
     if fairness < 0.7:
@@ -203,13 +227,14 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     if not recommendations:
         recommendations.append("The plan is operationally strong; minor gains remain in passenger delay reduction.")
 
+    # Calculate normalized score using defined weights
     normalized_score = (
-        0.24 * completeness
-        + 0.24 * conflict_free_ratio
-        + 0.18 * priority_handling
-        + 0.16 * delay_efficiency
-        + 0.10 * fairness
-        + 0.08 * fuel_efficiency
+        SCORE_WEIGHTS["completeness"] * completeness
+        + SCORE_WEIGHTS["conflict_free"] * conflict_free_ratio
+        + SCORE_WEIGHTS["priority"] * priority_handling
+        + SCORE_WEIGHTS["delay"] * delay_efficiency
+        + SCORE_WEIGHTS["fairness"] * fairness
+        + SCORE_WEIGHTS["fuel"] * fuel_efficiency
     )
     normalized_score *= completeness
     if conflict_count > 0:
@@ -217,17 +242,17 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     normalized_score = max(0.0, min(1.0, normalized_score))
 
     metrics = TaskMetrics(
-        schedule_completeness=round(completeness, 4),
-        conflict_free_ratio=round(conflict_free_ratio, 4),
-        priority_handling=round(priority_handling, 4),
-        delay_efficiency=round(delay_efficiency, 4),
-        fairness=round(fairness, 4),
-        fuel_efficiency=round(fuel_efficiency, 4),
+        schedule_completeness=round(completeness, METRIC_PRECISION),
+        conflict_free_ratio=round(conflict_free_ratio, METRIC_PRECISION),
+        priority_handling=round(priority_handling, METRIC_PRECISION),
+        delay_efficiency=round(delay_efficiency, METRIC_PRECISION),
+        fairness=round(fairness, METRIC_PRECISION),
+        fuel_efficiency=round(fuel_efficiency, METRIC_PRECISION),
         agent_judgment=0.0,
-        overall_score=round(normalized_score, 4),
+        overall_score=round(normalized_score, METRIC_PRECISION),
         total_delay_minutes=total_delay,
         max_delay_minutes=max_delay,
-        estimated_fuel_burn=round(fuel_burn, 2),
+        estimated_fuel_burn=round(fuel_burn, FUEL_PRECISION),
         conflict_count=conflict_count,
         capacity_violations=capacity_violations,
         priority_violations=priority_violations,
@@ -237,7 +262,7 @@ def simulate_plan(task: TaskDefinition, proposal: Iterable[SlotAssignment]) -> S
     )
     return SimulationOutcome(
         metrics=metrics,
-        diagnostics=diagnostics[:12],
-        recommendations=recommendations[:6],
+        diagnostics=diagnostics[:MAX_DIAGNOSTICS],
+        recommendations=recommendations[:MAX_RECOMMENDATIONS],
         normalized_score=normalized_score,
     )

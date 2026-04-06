@@ -5,18 +5,24 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV API_BASE_URL=https://router.huggingface.co/v1
+ENV MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+ENV HF_TOKEN=
+ENV PYTHONPATH=/app
+ENV PATH="/app/.venv/bin:${PATH}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml uv.lock README.md openenv.yaml /app/
-COPY __init__.py client.py engine.py graders.py inference.py models.py planner.py tasks.py /app/
+COPY pyproject.toml README.md openenv.yaml /app/
+COPY uv.lock /app/
+COPY __init__.py client.py constants.py engine.py graders.py imports.py inference.py models.py planner.py tasks.py /app/
 COPY server /app/server
 COPY scripts /app/scripts
 
 RUN pip install --no-cache-dir uv \
-    && uv sync --system --frozen
+    && uv sync --frozen --no-dev
 
 EXPOSE 8000
 

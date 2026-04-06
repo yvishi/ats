@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from typing import Dict, List, Literal
 
 from openenv.core.env_server.types import Action, Observation, State
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OperationType(str, Enum):
@@ -41,12 +42,22 @@ class Difficulty(str, Enum):
     HARD = "hard"
 
 
+DEFAULT_ALLOWED_OPERATIONS = (
+    OperationType.ARRIVAL,
+    OperationType.DEPARTURE,
+)
+
+
+def default_allowed_operations() -> List[OperationType]:
+    return list(DEFAULT_ALLOWED_OPERATIONS)
+
+
 class RunwaySpec(BaseModel):
     """Runway configuration available to the controller."""
 
     runway_id: str = Field(..., description="Runway identifier")
     allowed_operations: List[OperationType] = Field(
-        default_factory=lambda: [OperationType.ARRIVAL, OperationType.DEPARTURE],
+        default_factory=default_allowed_operations,
         description="Operations permitted on the runway",
     )
     hourly_capacity: int = Field(
@@ -166,6 +177,24 @@ class ATCOptimizationAction(Action):
         default=True,
         description="Whether to finish the episode after evaluating this plan",
     )
+
+    @field_validator("proposal", mode="before")
+    @classmethod
+    def parse_proposal_json(cls, value):
+        """Allow playground users to paste proposal JSON into a text box."""
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "proposal must be a JSON list of slot assignments"
+                ) from exc
+            return parsed
+        return value
 
 
 class ATCOptimizationObservation(Observation):

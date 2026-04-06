@@ -18,6 +18,7 @@ try:
         PlanSnapshot,
         TaskDefinition,
         TaskGrade,
+        TaskMetrics,
     )
     from ..tasks import ordered_tasks, render_task_briefing, task_catalog
 except ImportError:
@@ -30,6 +31,7 @@ except ImportError:
         PlanSnapshot,
         TaskDefinition,
         TaskGrade,
+        TaskMetrics,
     )
     from tasks import ordered_tasks, render_task_briefing, task_catalog
 
@@ -107,12 +109,10 @@ class ATCOptimizationEnvironment(
     def step(
         self,
         action: ATCOptimizationAction,
-        timeout_s: Optional[float] = None,
         **_: object,
     ) -> ATCOptimizationObservation:
         """Score a candidate slot plan and emit dense reward feedback."""
 
-        del timeout_s
         if self._task is None:
             return self.reset()
 
@@ -187,7 +187,7 @@ class ATCOptimizationEnvironment(
             name="ATC Optimization OpenEnv",
             description="Realistic air traffic control disruption recovery benchmark.",
             version="1.0.0",
-            author="OpenAI Codex",
+            author="ATC Optimization OpenEnv Contributors",
             readme_content=readme_content,
         )
 
@@ -222,9 +222,7 @@ class ATCOptimizationEnvironment(
             done=done,
         )
 
-    def _build_summary(
-        self, metrics, grades: List[TaskGrade], done: bool
-    ) -> str:
+    def _build_summary(self, metrics: TaskMetrics, grades: List[TaskGrade], done: bool) -> str:
         lead_grade = next(
             (grade for grade in grades if grade.grader_name == "composite_task_grader"),
             grades[-1],

@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
-from openai import OpenAI
+from openai import APIConnectionError, APIError, APITimeoutError, OpenAI, OpenAIError, RateLimitError
 
 try:
     from .engine import SimulationOutcome
@@ -45,7 +45,7 @@ class SupervisorHeuristicGrader(BaseTaskGrader):
         proposal: Iterable[SlotAssignment],
         rationale: str = "",
     ) -> TaskGrade:
-        proposal_count = len(list(proposal))
+        proposal_count = len(proposal) if isinstance(proposal, Sequence) else sum(1 for _ in proposal)
         rationale_bonus = 0.08 if len(rationale.split()) >= 12 else 0.03 if rationale else 0.0
         diagnostic_penalty = min(0.12, 0.01 * len(outcome.diagnostics))
         missing_penalty = min(
@@ -85,6 +85,63 @@ class SupervisorHeuristicGrader(BaseTaskGrader):
                 "priority_handling": outcome.metrics.priority_handling,
                 "fairness": outcome.metrics.fairness,
                 "delay_efficiency": outcome.metrics.delay_efficiency,
+            },
+        )
+
+
+class DeterministicAuditGrader(BaseTaskGrader):
+    """Explicit exploit-resistant audit used in the official submission score."""
+
+    grader_name = "deterministic_audit"
+
+    def grade(
+        self,
+        task: TaskDefinition,
+        outcome: SimulationOutcome,
+        proposal: Iterable[SlotAssignment],
+        rationale: str = "",
+    ) -> TaskGrade:
+        del task, proposal, rationale
+        metrics = outcome.metrics
+        safety_score = max(
+            0.0,
+            1.0
+            - 0.30 * metrics.conflict_count
+            - 0.12 * metrics.invalid_assignments
+            - 0.10 * metrics.missing_assignments
+            - 0.10 * metrics.priority_violations,
+        )
+        efficiency_score = max(
+            0.0,
+            min(
+                1.0,
+                0.55 * metrics.delay_efficiency
+                + 0.25 * metrics.fairness
+                + 0.20 * metrics.fuel_efficiency,
+            ),
+        )
+        score = max(
+            0.0,
+            min(
+                1.0,
+                0.70 * safety_score
+                + 0.30 * efficiency_score,
+            ),
+        )
+        rationale_text = (
+            "The deterministic audit found the plan safe, complete, and operationally balanced."
+            if score >= 0.85
+            else "The deterministic audit accepted the plan but found avoidable operational weaknesses."
+            if score >= 0.55
+            else "The deterministic audit rejected the plan because it remained unsafe, incomplete, or poorly prioritized."
+        )
+        return TaskGrade(
+            grader_name=self.grader_name,
+            score=round(score, 4),
+            rationale=rationale_text,
+            sub_scores={
+                "safety_score": round(safety_score, 4),
+                "efficiency_score": round(efficiency_score, 4),
             },
         )
 
@@ -151,10 +208,27 @@ class LLMSupervisorGrader(BaseTaskGrader):
                 ],
             )
             raw_text = (response.choices[0].message.content or "").strip()
-            data = json.loads(raw_text)
+            start = raw_text.find("{")
+            end = raw_text.rfind("}")
+            if start == -1 or end == -1:
+                raise ValueError("LLM grader response is not JSON")
+            data = json.loads(raw_text[start : end + 1])
+            if not isinstance(data, dict):
+                raise ValueError("LLM grader payload must be a JSON object")
             score = max(0.0, min(1.0, float(data.get("score", 0.0))))
             rationale_text = str(data.get("rationale", "LLM grader returned no rationale."))
-        except Exception as exc:
+        except (
+            APIConnectionError,
+            APITimeoutError,
+            APIError,
+            RateLimitError,
+            OpenAIError,
+            json.JSONDecodeError,
+            ValueError,
+            KeyError,
+            AttributeError,
+            TypeError,
+        ) as exc:
             score = outcome.metrics.overall_score
             rationale_text = f"LLM grading failed, reverted to deterministic score: {exc}"
 
@@ -167,13 +241,13 @@ class LLMSupervisorGrader(BaseTaskGrader):
 
 
 class CompositeTaskGrader(BaseTaskGrader):
-    """Blends deterministic and optional LLM judgment into one score."""
+    """Official deterministic benchmark score used for submission comparisons."""
 
     grader_name = "composite_task_grader"
 
     def __init__(self) -> None:
         self.heuristic = SupervisorHeuristicGrader()
-        self.llm = LLMSupervisorGrader()
+        self.audit = DeterministicAuditGrader()
 
     def grade(
         self,
@@ -182,21 +256,22 @@ class CompositeTaskGrader(BaseTaskGrader):
         proposal: Iterable[SlotAssignment],
         rationale: str = "",
     ) -> TaskGrade:
-        proposal_list = list(proposal)
+        proposal_list = proposal if isinstance(proposal, list) else list(proposal)
         heuristic = self.heuristic.grade(task, outcome, proposal_list, rationale)
-        llm = self.llm.grade(task, outcome, proposal_list, rationale)
+        audit = self.audit.grade(task, outcome, proposal_list, rationale)
         final_score = max(
             0.0,
             min(
                 1.0,
                 0.65 * outcome.metrics.overall_score
                 + 0.20 * heuristic.score
-                + 0.15 * llm.score,
+                + 0.15 * audit.score,
             ),
         )
         rationale_text = (
+            "Official score is deterministic for reproducible benchmarking and hackathon comparability. "
             f"Heuristic supervisor: {heuristic.rationale} "
-            f"LLM supervisor: {llm.rationale}"
+            f"Deterministic audit: {audit.rationale}"
         )
         return TaskGrade(
             grader_name=self.grader_name,
@@ -204,7 +279,7 @@ class CompositeTaskGrader(BaseTaskGrader):
             rationale=rationale_text,
             sub_scores={
                 "heuristic": heuristic.score,
-                "llm": llm.score,
+                "audit": audit.score,
             },
         )
 
@@ -219,8 +294,9 @@ def grade_task(
 
     graders: List[BaseTaskGrader] = [
         SupervisorHeuristicGrader(),
-        LLMSupervisorGrader(),
+        DeterministicAuditGrader(),
         CompositeTaskGrader(),
+        LLMSupervisorGrader(),
     ]
-    proposal_list = list(proposal)
+    proposal_list = proposal if isinstance(proposal, list) else list(proposal)
     return [grader.grade(task, outcome, proposal_list, rationale) for grader in graders]

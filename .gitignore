@@ -5,3 +5,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.egg-info/
+.env
+*.env
+.env.hf_space
+.env.hf_space.local

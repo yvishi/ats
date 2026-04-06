@@ -2,7 +2,7 @@
 
 try:
     from openenv.core.env_server.http_server import create_app
-except Exception as exc:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "openenv is required to run this environment. Install dependencies first."
     ) from exc
