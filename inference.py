@@ -34,10 +34,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 GENERIC_API_KEY = os.getenv("API_KEY", "").strip()
 
 if GROQ_API_KEY:
+    # Prefer Groq when explicitly configured for low-latency inference.
     API_BASE_URL = os.getenv("GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL).rstrip("/")
     MODEL_NAME = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
     API_KEY = GROQ_API_KEY
 else:
+    # Otherwise use any OpenAI-compatible endpoint (HF router, OpenAI, etc.).
     API_BASE_URL = os.getenv("API_BASE_URL", DEFAULT_HF_BASE_URL).rstrip("/")
     MODEL_NAME = os.getenv("MODEL_NAME", DEFAULT_HF_MODEL)
     API_KEY = HF_TOKEN or OPENAI_API_KEY or GENERIC_API_KEY

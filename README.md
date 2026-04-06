@@ -131,7 +131,7 @@ python test_groq_inference.py  # Test the setup
 python -m inference            # Run full inference
 ```
 
-See [GROQ_SETUP.md](GROQ_SETUP.md) for detailed configuration and troubleshooting.
+Use [test_groq_inference.py](test_groq_inference.py) to validate Groq connectivity and JSON output format.
 
 ### Reproducible baseline scores
 
@@ -185,7 +185,7 @@ python test_groq_inference.py  # verify setup
 python -m inference            # run full benchmark
 ```
 
-See [GROQ_SETUP.md](GROQ_SETUP.md) for detailed guide.
+Use [test_groq_inference.py](test_groq_inference.py) to validate credentials before full runs.
 
 ### Environment variables - Option 2: HuggingFace API
 
