@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="${1:-.}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR_INPUT="${1:-$SCRIPT_DIR/..}"
+REPO_DIR="$(cd "$REPO_DIR_INPUT" && pwd)"
 PING_URL="${PING_URL:-}"
 
 echo "Step 0/5: Checking release branch hygiene"

@@ -183,6 +183,8 @@ For local testing without an LLM endpoint, the script still runs by falling back
 python -m inference  # Uses heuristic baseline only
 ```
 
+Use `python -m inference` (module name only), not `python -m inference.py`.
+
 
 ## Running the environment
 
