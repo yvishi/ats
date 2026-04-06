@@ -44,6 +44,10 @@ def _bool_token(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _step_budget(steps_remaining: int) -> int:
+    return min(MAX_STEPS_CAP, max(1, int(steps_remaining)))
+
+
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
@@ -114,6 +118,8 @@ async def prepare_base_url() -> Tuple[str, Optional[subprocess.Popen]]:
 def build_seed_plan(observation, step: int):
     if not observation.flights:
         raise ValueError("observation contains no flights")
+    if observation.steps_remaining < 0:
+        raise ValueError("observation.steps_remaining cannot be negative")
     if step <= 1 or not observation.current_plan:
         return build_heuristic_plan(observation)
     return build_refined_plan(observation, seed_plan=list(observation.current_plan))
@@ -123,8 +129,12 @@ def _extract_json_object(response_text: str) -> dict:
     start = response_text.find("{")
     end = response_text.rfind("}")
     if start == -1 or end == -1:
-        raise ValueError(f"response is not JSON: {response_text[:120]}")
-    payload = json.loads(response_text[start : end + 1])
+        try:
+            payload = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"response is not JSON: {response_text[:120]}") from exc
+    else:
+        payload = json.loads(response_text[start : end + 1])
     if not isinstance(payload, dict):
         raise ValueError(f"response payload is not an object: {type(payload)}")
     return payload
@@ -133,7 +143,7 @@ def _extract_json_object(response_text: str) -> dict:
 def get_model_action(client: Optional[OpenAI], observation, task_id: str, step: int) -> ATCOptimizationAction:
     seed_plan = build_seed_plan(observation, step)
     seed_json = json.dumps([item.model_dump() for item in seed_plan], ensure_ascii=True)
-    should_commit = step >= min(MAX_STEPS_CAP, max(1, observation.steps_remaining))
+    should_commit = step >= _step_budget(observation.steps_remaining)
 
     if client is None or not API_BASE_URL or not HF_TOKEN or MODEL_NAME == "heuristic-baseline":
         return ATCOptimizationAction(
@@ -182,6 +192,8 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str, step: 
         payload = _extract_json_object(text)
         if "proposal" not in payload:
             raise ValueError("response missing 'proposal' field")
+        if not isinstance(payload["proposal"], list):
+            raise ValueError("response field 'proposal' must be a list")
 
         action = ATCOptimizationAction.model_validate(
             {
@@ -225,7 +237,7 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
         env = ATCOptimizationEnv(base_url=base_url)
         await env.__aenter__()
         result = await env.reset(task_id=task_id)
-        max_steps = min(MAX_STEPS_CAP, max(1, result.observation.steps_remaining))
+        max_steps = _step_budget(result.observation.steps_remaining)
 
         for step_index in range(max_steps):
             if result.done:
