@@ -157,6 +157,9 @@ def main() -> int:
         "__pycache__",
         "*.pyc",
         ".env",
+        ".env.*",
+        "*.env",
+        "*.env.*",
         ".codex",
         ".github",
     ]

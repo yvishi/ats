@@ -7,3 +7,5 @@ __pycache__/
 *.egg-info/
 .env
 *.env
+.env.hf_space
+.env.hf_space.local

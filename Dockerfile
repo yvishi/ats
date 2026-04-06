@@ -9,6 +9,7 @@ ENV API_BASE_URL=https://router.huggingface.co/v1
 ENV MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
 ENV HF_TOKEN=
 ENV PYTHONPATH=/app
+ENV PATH="/app/.venv/bin:${PATH}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl \
@@ -21,7 +22,7 @@ COPY server /app/server
 COPY scripts /app/scripts
 
 RUN pip install --no-cache-dir uv \
-    && uv sync --system --frozen
+    && uv sync --frozen --no-dev
 
 EXPOSE 8000
 
