@@ -20,18 +20,28 @@ if str(ROOT) not in sys.path:
 
 from client import ATCOptimizationEnv
 from models import ATCOptimizationAction
-from planner import build_heuristic_plan
+from planner import build_heuristic_plan, build_refined_plan
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    raise ValueError(
-        "HF_TOKEN environment variable is required. "
-        "Set it to your Hugging Face API token."
-    )
-API_KEY = HF_TOKEN
+DEFAULT_HF_BASE_URL = "https://router.huggingface.co/v1"
+DEFAULT_HF_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+GENERIC_API_KEY = os.getenv("API_KEY", "").strip()
+
+if GROQ_API_KEY:
+    API_BASE_URL = os.getenv("GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL).rstrip("/")
+    MODEL_NAME = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
+    API_KEY = GROQ_API_KEY
+else:
+    API_BASE_URL = os.getenv("API_BASE_URL", DEFAULT_HF_BASE_URL).rstrip("/")
+    MODEL_NAME = os.getenv("MODEL_NAME", DEFAULT_HF_MODEL)
+    API_KEY = HF_TOKEN or OPENAI_API_KEY or GENERIC_API_KEY
+
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", os.getenv("IMAGE_NAME", ""))
 BENCHMARK = "atc_optimization_openenv"
 TASK_IDS = [
@@ -40,6 +50,7 @@ TASK_IDS = [
     "bengaluru_irrops_hard",
 ]
 SUCCESS_SCORE_THRESHOLD = 0.65
+MAX_STEPS = 2
 MAX_TOKENS = 1400
 TEMPERATURE = 0
 
@@ -56,10 +67,10 @@ def log_step(step: int, action: str, reward: float, done: bool, error: Optional[
     )
 
 
-def log_end(success: bool, steps: int, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_text = ",".join(f"{item:.2f}" for item in rewards)
     print(
-        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_text}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_text}",
         flush=True,
     )
 
@@ -108,17 +119,27 @@ async def prepare_base_url() -> Tuple[str, Optional[subprocess.Popen]]:
         raise
 
 
-def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATCOptimizationAction:
-    heuristic_plan = build_heuristic_plan(observation)
+def build_seed_plan(observation, step: int):
+    if step <= 1 or not observation.current_plan:
+        return build_heuristic_plan(observation)
+    return build_refined_plan(observation, seed_plan=list(observation.current_plan))
+
+
+def get_model_action(client: Optional[OpenAI], observation, task_id: str, step: int) -> ATCOptimizationAction:
+    seed_plan = build_seed_plan(observation, step)
     heuristic_json = json.dumps(
-        [item.model_dump() for item in heuristic_plan],
+        [item.model_dump() for item in seed_plan],
         ensure_ascii=True,
     )
+    should_commit = step >= min(MAX_STEPS, max(1, observation.steps_remaining))
     if client is None or not API_BASE_URL or not API_KEY or MODEL_NAME == "heuristic-baseline":
         return ATCOptimizationAction(
-            proposal=heuristic_plan,
-            rationale="Deterministic heuristic baseline used because no model endpoint is configured.",
-            commit=True,
+            proposal=seed_plan,
+            rationale=(
+                "Deterministic multi-step baseline used because no model endpoint is configured. "
+                f"Planning step {step} {'refines the prior plan' if step > 1 else 'establishes a safe initial schedule'}."
+            ),
+            commit=should_commit,
         )
 
     prompt = (
@@ -127,8 +148,12 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
         "proposal must be an array of objects with flight_id, runway, assigned_minute, hold_minutes.\n"
         "Do not omit any flight. Keep assignments conflict-free and priority aware.\n\n"
         f"Task: {task_id}\n"
+        f"Planning step: {step}\n"
         f"Briefing:\n{observation.briefing}\n\n"
-        f"Heuristic candidate plan:\n{heuristic_json}\n"
+        f"Current metrics: {observation.current_metrics.model_dump_json()}\n"
+        f"Diagnostics: {json.dumps(observation.diagnostics)}\n"
+        f"Recommendations: {json.dumps(observation.recommendations)}\n"
+        f"Seed candidate plan:\n{heuristic_json}\n"
     )
     try:
         completion = client.chat.completions.create(
@@ -136,7 +161,10 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a conservative ATC planner. Output strict JSON only.",
+                    "content": (
+                        "You are a conservative ATC planner. Output strict JSON only. "
+                        "When this is not the final step, improve the plan but keep it open for one more evaluation."
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -163,7 +191,7 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
             {
                 "proposal": payload["proposal"],
                 "rationale": payload.get("rationale", "Model-generated ATC plan."),
-                "commit": True,
+                "commit": should_commit,
             }
         )
         if len(action.proposal) < len(observation.flights):
@@ -172,9 +200,9 @@ def get_model_action(client: Optional[OpenAI], observation, task_id: str) -> ATC
     except (ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"Model request failed for {task_id}: {exc}", file=sys.stderr, flush=True)
         return ATCOptimizationAction(
-            proposal=heuristic_plan,
+            proposal=seed_plan,
             rationale="Fell back to the deterministic heuristic planner after model failure.",
-            commit=True,
+            commit=should_commit,
         )
 
 
@@ -185,14 +213,17 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
     success = False
     runtime_model = MODEL_NAME if client is not None else "heuristic-baseline"
     log_start(task=task_id, env=BENCHMARK, model=runtime_model)
+    env: Optional[ATCOptimizationEnv] = None
 
-    async with ATCOptimizationEnv(base_url=base_url) as env:
+    try:
+        env = ATCOptimizationEnv(base_url=base_url)
+        await env.__aenter__()
         result = await env.reset(task_id=task_id)
-        max_steps = result.observation.steps_remaining
+        max_steps = min(MAX_STEPS, max(1, result.observation.steps_remaining))
         for step in range(1, max_steps + 1):
             if result.done:
                 break
-            action = get_model_action(client, result.observation, task_id)
+            action = get_model_action(client, result.observation, task_id, step)
             result = await env.step(action)
             reward = float(result.reward or 0.0)
             rewards.append(reward)
@@ -212,9 +243,14 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
 
         score = max(0.0, min(1.0, result.observation.current_metrics.overall_score))
         success = score >= SUCCESS_SCORE_THRESHOLD
-
-    log_end(success=success, steps=steps_taken, rewards=rewards)
-    return score
+        return score
+    except Exception as exc:
+        print(f"Task execution failed for {task_id}: {exc}", file=sys.stderr, flush=True)
+        return 0.0
+    finally:
+        if env is not None:
+            await env.__aexit__(None, None, None)
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 async def main() -> None:
