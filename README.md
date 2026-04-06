@@ -233,6 +233,22 @@ python scripts/ping_env.py https://<your-space>.hf.space
 
 The Space should return `200` on `/health` and respond to `/reset`.
 
+### Deploy with Hugging Face API
+
+You can deploy/update the Space directly with the API helper:
+
+```bash
+export HF_TOKEN="hf_xxx"
+export HF_SPACE_ID="<your-username>/<your-space-name>"
+python scripts/deploy_hf_space.py --space-id "$HF_SPACE_ID" --repo-dir .
+```
+
+Then validate against the live Space URL:
+
+```bash
+./scripts/validate-submission.sh "https://<your-username>-<your-space-name>.hf.space" .
+```
+
 ## Docker
 
 Build locally:
