@@ -114,24 +114,14 @@ The official benchmark score is now fully deterministic. The optional LLM grader
 
 [inference.py](inference.py) is the required root-level inference script. It:
 
-- supports both **Groq API** (Llama 3.1 8B) and OpenAI-compatible endpoints
-- reads `GROQ_API_KEY` for Groq inference, or `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` for HuggingFace
+- uses the OpenAI Python client for LLM calls
+- reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`
 - emits strict `[START]`, `[STEP]`, and `[END]` logs
 - runs all three tasks
 - uses a two-step deterministic planning loop from [planner.py](planner.py)
 - falls back to the deterministic planner if model output fails
 
 The deterministic baseline now submits a safe seed plan first and then submits a refined plan on the next step. That makes the reward shaping visible in the logs and gives the hard task a more realistic revise-and-improve trajectory. When a model endpoint is configured, the LLM gets the task briefing, metrics, diagnostics, and a deterministic seed plan and is asked to return strict JSON.
-
-### Running with Groq API (Llama 3.1 8B)
-
-```bash
-export GROQ_API_KEY="your-groq-api-key"
-python test_groq_inference.py  # Test the setup
-python -m inference            # Run full inference
-```
-
-Use [test_groq_inference.py](test_groq_inference.py) to validate Groq connectivity and JSON output format.
 
 ### Reproducible baseline scores
 
@@ -170,32 +160,17 @@ pip install uv
 uv sync
 ```
 
-### Environment variables - Option 1: Groq API (Recommended)
+### Required environment variables
 
-For fast inference with Llama 3.1 8B:
-
-```bash
-export GROQ_API_KEY="your-groq-api-key"
-export GROQ_MODEL="llama-3.1-8b-instant"  # optional, defaults to this
-```
-
-Then run:
-```bash
-python test_groq_inference.py  # verify setup
-python -m inference            # run full benchmark
-```
-
-Use [test_groq_inference.py](test_groq_inference.py) to validate credentials before full runs.
-
-### Environment variables - Option 2: HuggingFace API
-
-For OpenAI-compatible endpoints:
+Before running `inference.py`, define:
 
 ```bash
 export API_BASE_URL="https://your-llm-endpoint/v1"
 export MODEL_NAME="your-model-name"
 export HF_TOKEN="your-secret-token"
 ```
+
+`OPENAI_API_KEY` is intentionally not used in release inference to keep benchmark configuration deterministic.
 
 ### Testing without LLM
 
