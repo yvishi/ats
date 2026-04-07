@@ -35,6 +35,7 @@ TASK_IDS = [
     "bengaluru_irrops_hard",
 ]
 SUCCESS_SCORE_THRESHOLD = 0.65
+SCORE_EPSILON = 1e-4
 MAX_STEPS_CAP = int(os.getenv("MAX_STEPS_CAP", "4"))
 MAX_TOKENS = 1400
 TEMPERATURE = 0
@@ -253,12 +254,12 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
             if result.done:
                 break
 
-        score = max(0.0, min(1.0, result.observation.current_metrics.overall_score))
+        score = max(SCORE_EPSILON, min(1.0 - SCORE_EPSILON, result.observation.current_metrics.overall_score))
         success = score >= SUCCESS_SCORE_THRESHOLD
         return score
     except (RuntimeError, ValueError, KeyError, TypeError) as exc:
         print(f"Task execution failed for {task_id}: {exc}", file=sys.stderr, flush=True)
-        return 0.0
+        return SCORE_EPSILON
     finally:
         if env is not None:
             await env.__aexit__(None, None, None)

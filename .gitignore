@@ -9,3 +9,4 @@ __pycache__/
 *.env
 .env.hf_space
 .env.hf_space.local
+comman.txt

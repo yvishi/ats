@@ -385,7 +385,7 @@ def render_task_briefing(task: TaskDefinition) -> str:
     lines.append("")
 
     lines.append("## Wake Turbulence Separation (minutes between consecutive movements)")
-    lines.append("  Leader→Follower : H→H=4  H→M=3  H→L=6  M→H=3  M→M=3  M→L=4  L→H=3  L→M=3  L→L=3")
+    lines.append("  Leader→Follower : H→H=4  H→M=5  H→L=6  M→H=3  M→M=3  M→L=4  L→H=3  L→M=3  L→L=3")
     lines.append("")
 
     lines.append("## Flights (flight_id | airline | op | wake | sched | window | runways | priority | risk | notes)")

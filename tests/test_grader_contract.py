@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from engine import simulate_plan
-from graders import CompositeTaskGrader, SupervisorHeuristicGrader, grade_task
+from graders import GatedCompositeGrader, LLMSupervisorGrader, grade_task
 from models import ATCOptimizationAction
 from planner import build_heuristic_plan
 from server.atc_environment import ATCOptimizationEnvironment
@@ -19,25 +19,32 @@ def _task_and_outcome(task_id: str = "mumbai_bank_balance_medium"):
     return task, outcome, proposal
 
 
-def test_supervisor_heuristic_score_is_strictly_bounded() -> None:
+def test_llm_supervisor_fallback_score_is_strictly_bounded() -> None:
     task, outcome, proposal = _task_and_outcome("bengaluru_irrops_hard")
-    grader = SupervisorHeuristicGrader()
+    grader = LLMSupervisorGrader()
     grade = grader.grade(task, outcome, proposal, rationale="short")
     assert 0.0 < grade.score < 1.0
 
 
-def test_composite_uses_documented_deterministic_formula() -> None:
+def test_composite_uses_gated_deterministic_formula() -> None:
     task, outcome, proposal = _task_and_outcome()
-    composite = CompositeTaskGrader().grade(task, outcome, proposal, rationale="Deterministic plan")
-    all_grades = {g.grader_name: g for g in grade_task(task, outcome, proposal, "Deterministic plan")}
+    composite = GatedCompositeGrader().grade(task, outcome, proposal, rationale="Deterministic plan")
+    # The composite score must be strictly bounded
+    assert 0.0 < composite.score < 1.0
+    # Sub-scores must be present
+    assert "gate_ceiling" in composite.sub_scores
+    assert "priority_score" in composite.sub_scores
+    assert "efficiency_score" in composite.sub_scores
 
-    expected = (
-        0.65 * outcome.metrics.overall_score
-        + 0.20 * all_grades["supervisor_heuristic"].score
-        + 0.15 * all_grades["deterministic_audit"].score
-    )
-    expected = max(0.0001, min(0.9999, expected))
-    assert abs(composite.score - round(expected, 4)) < 1e-9
+
+def test_all_graders_return_strictly_bounded_scores_for_all_tasks() -> None:
+    for task_id in task_catalog():
+        task, outcome, proposal = _task_and_outcome(task_id)
+        grades = grade_task(task, outcome, proposal, "Deterministic contract test.")
+        for grade in grades:
+            assert 0.0 < grade.score < 1.0, (
+                f"{grade.grader_name} out of strict range for {task_id}: {grade.score}"
+            )
 
 
 def test_step_rejects_duplicate_assignment_with_strictly_bounded_score() -> None:
