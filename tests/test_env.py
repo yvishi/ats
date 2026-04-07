@@ -16,7 +16,7 @@ def test_reset_exposes_tasks() -> None:
     assert obs.steps_remaining > 0
 
 
-def test_step_returns_bounded_score() -> None:
+def test_step_returns_strictly_bounded_score() -> None:
     env = ATCOptimizationEnvironment()
     obs = env.reset(task_id="mumbai_bank_balance_medium")
     proposal = build_heuristic_plan(obs)
@@ -27,7 +27,7 @@ def test_step_returns_bounded_score() -> None:
             commit=True,
         )
     )
-    assert 0.0 <= result.current_metrics.overall_score <= 1.0
+    assert 0.0 < result.current_metrics.overall_score < 1.0
     assert result.done is True
 
 

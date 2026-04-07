@@ -1,4 +1,4 @@
-"""Enumerate tasks, run the graders, and assert score ranges."""
+"""Enumerate tasks, run the graders, and assert strict score ranges."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def main() -> int:
         outcome = simulate_plan(task, proposal)
         grades = grade_task(task, outcome, proposal, "Deterministic two-step baseline.")
         for grade in grades:
-            assert 0.0 <= grade.score <= 1.0, f"{grade.grader_name} out of range for {task.task_id}"
+            assert 0.0 < grade.score < 1.0, f"{grade.grader_name} out of strict range for {task.task_id}"
         rows.append(
             {
                 "task_id": task.task_id,

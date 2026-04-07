@@ -17,6 +17,16 @@ except ImportError:
     from models import SlotAssignment, TaskDefinition, TaskGrade
 
 
+STRICT_SCORE_EPSILON = 1e-4
+
+
+def _strict_score(value: float) -> float:
+    """Normalize to the strict open interval (0, 1) with stable output precision."""
+
+    clipped = max(STRICT_SCORE_EPSILON, min(1.0 - STRICT_SCORE_EPSILON, float(value)))
+    return round(clipped, 4)
+
+
 class BaseTaskGrader(ABC):
     """Base class for task graders."""
 
@@ -30,7 +40,7 @@ class BaseTaskGrader(ABC):
         proposal: Iterable[SlotAssignment],
         rationale: str = "",
     ) -> TaskGrade:
-        """Return a score in the inclusive range [0.0, 1.0]."""
+        """Return a score in the strict range (0.0, 1.0)."""
 
 
 class SupervisorHeuristicGrader(BaseTaskGrader):
@@ -45,6 +55,10 @@ class SupervisorHeuristicGrader(BaseTaskGrader):
         proposal: Iterable[SlotAssignment],
         rationale: str = "",
     ) -> TaskGrade:
+        # Change timeline:
+        # - 43bbf9a/d6b41a8/149cb7a used `len(list(proposal))`.
+        # - 13c984e changed this line to avoid materializing/consuming iterators
+        #   when `proposal` is already a Sequence.
         proposal_count = len(proposal) if isinstance(proposal, Sequence) else sum(1 for _ in proposal)
         rationale_bonus = 0.08 if len(rationale.split()) >= 12 else 0.03 if rationale else 0.0
         diagnostic_penalty = min(0.12, 0.01 * len(outcome.diagnostics))
@@ -78,19 +92,22 @@ class SupervisorHeuristicGrader(BaseTaskGrader):
         )
         return TaskGrade(
             grader_name=self.grader_name,
-            score=round(score, 4),
+            score=_strict_score(score),
             rationale=rationale_text,
             sub_scores={
-                "conflict_free_ratio": outcome.metrics.conflict_free_ratio,
-                "priority_handling": outcome.metrics.priority_handling,
-                "fairness": outcome.metrics.fairness,
-                "delay_efficiency": outcome.metrics.delay_efficiency,
+                "conflict_free_ratio": _strict_score(outcome.metrics.conflict_free_ratio),
+                "priority_handling": _strict_score(outcome.metrics.priority_handling),
+                "fairness": _strict_score(outcome.metrics.fairness),
+                "delay_efficiency": _strict_score(outcome.metrics.delay_efficiency),
             },
         )
 
 
 class DeterministicAuditGrader(BaseTaskGrader):
     """Explicit exploit-resistant audit used in the official submission score."""
+    # Change timeline:
+    # - Introduced in 149cb7a as a new deterministic safety/efficiency audit.
+    # - 13c984e kept the scoring formula and thresholds unchanged.
 
     grader_name = "deterministic_audit"
 
@@ -137,17 +154,23 @@ class DeterministicAuditGrader(BaseTaskGrader):
         )
         return TaskGrade(
             grader_name=self.grader_name,
-            score=round(score, 4),
+            score=_strict_score(score),
             rationale=rationale_text,
             sub_scores={
-                "safety_score": round(safety_score, 4),
-                "efficiency_score": round(efficiency_score, 4),
+                "safety_score": _strict_score(safety_score),
+                "efficiency_score": _strict_score(efficiency_score),
             },
         )
 
 
 class LLMSupervisorGrader(BaseTaskGrader):
     """Optional LLM-backed supervisor used when credentials are available."""
+    # Change timeline:
+    # - 43bbf9a initially parsed with `json.loads(raw_text)` and used broad
+    #   `except Exception` fallback.
+    # - d6b41a8 narrowed fallback exceptions to parse/shape errors.
+    # - 13c984e added API error classes, JSON object extraction, payload type
+    #   validation, and explicit handling for transport/rate-limit/timeouts.
 
     grader_name = "llm_supervisor"
 
@@ -169,9 +192,9 @@ class LLMSupervisorGrader(BaseTaskGrader):
         if not self._enabled():
             return TaskGrade(
                 grader_name=self.grader_name,
-                score=round(outcome.metrics.overall_score, 4),
+                score=_strict_score(outcome.metrics.overall_score),
                 rationale="LLM grader disabled; using deterministic fallback identical to operational score.",
-                sub_scores={"fallback": outcome.metrics.overall_score},
+                sub_scores={"fallback": _strict_score(outcome.metrics.overall_score)},
             )
 
         client = OpenAI(base_url=self.api_base_url, api_key=self.api_key)
@@ -186,7 +209,7 @@ class LLMSupervisorGrader(BaseTaskGrader):
         prompt = (
             "You are a senior ATC supervisor grading a runway recovery plan.\n"
             "Return strict JSON with keys score and rationale.\n"
-            "Score must be a float between 0.0 and 1.0.\n\n"
+            "Score must be a float strictly between 0.0 and 1.0.\n\n"
             f"Task: {task.title}\n"
             f"Objective: {task.objective}\n"
             f"Operational metrics: {outcome.metrics.model_dump_json()}\n"
@@ -202,17 +225,23 @@ class LLMSupervisorGrader(BaseTaskGrader):
                 messages=[
                     {
                         "role": "system",
-                        "content": "Grade ATC recovery plans conservatively and output strict JSON only.",
+                        "content": (
+                            "Grade ATC recovery plans conservatively and output strict JSON only. "
+                            "Score must be strictly greater than 0 and strictly less than 1."
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
             )
             raw_text = (response.choices[0].message.content or "").strip()
+            # 13c984e: tolerate wrappers like markdown/code fences by slicing to
+            # the first JSON object instead of requiring pure JSON text.
             start = raw_text.find("{")
             end = raw_text.rfind("}")
             if start == -1 or end == -1:
                 raise ValueError("LLM grader response is not JSON")
             data = json.loads(raw_text[start : end + 1])
+            # 13c984e: enforce object payload so downstream `.get(...)` calls are safe.
             if not isinstance(data, dict):
                 raise ValueError("LLM grader payload must be a JSON object")
             score = max(0.0, min(1.0, float(data.get("score", 0.0))))
@@ -234,14 +263,20 @@ class LLMSupervisorGrader(BaseTaskGrader):
 
         return TaskGrade(
             grader_name=self.grader_name,
-            score=round(score, 4),
+            score=_strict_score(score),
             rationale=rationale_text,
-            sub_scores={"operational_score": outcome.metrics.overall_score},
+            sub_scores={"operational_score": _strict_score(outcome.metrics.overall_score)},
         )
 
 
 class CompositeTaskGrader(BaseTaskGrader):
     """Official deterministic benchmark score used for submission comparisons."""
+    # Change timeline:
+    # - 43bbf9a/d6b41a8 blended heuristic + LLM (`self.llm`, "llm" sub-score).
+    # - 149cb7a replaced LLM contribution with DeterministicAuditGrader
+    #   (`self.audit`, "audit" sub-score) for reproducible official scoring.
+    # - 13c984e kept formula but updated rationale wording for comparability and
+    #   avoided unnecessary proposal list copies when already a list.
 
     grader_name = "composite_task_grader"
 
@@ -256,6 +291,7 @@ class CompositeTaskGrader(BaseTaskGrader):
         proposal: Iterable[SlotAssignment],
         rationale: str = "",
     ) -> TaskGrade:
+        # 13c984e: no-op for list inputs, materialize once for one-shot iterables.
         proposal_list = proposal if isinstance(proposal, list) else list(proposal)
         heuristic = self.heuristic.grade(task, outcome, proposal_list, rationale)
         audit = self.audit.grade(task, outcome, proposal_list, rationale)
@@ -275,7 +311,7 @@ class CompositeTaskGrader(BaseTaskGrader):
         )
         return TaskGrade(
             grader_name=self.grader_name,
-            score=round(final_score, 4),
+            score=_strict_score(final_score),
             rationale=rationale_text,
             sub_scores={
                 "heuristic": heuristic.score,
@@ -292,11 +328,15 @@ def grade_task(
 ) -> List[TaskGrade]:
     """Run all task graders and return their scores."""
 
+    # Lineup timeline:
+    # - 43bbf9a/d6b41a8: heuristic -> llm -> composite
+    # - 149cb7a+: heuristic -> deterministic_audit -> composite -> llm
     graders: List[BaseTaskGrader] = [
         SupervisorHeuristicGrader(),
         DeterministicAuditGrader(),
         CompositeTaskGrader(),
         LLMSupervisorGrader(),
     ]
+    # 13c984e: preserve list proposals as-is; only materialize iterables once.
     proposal_list = proposal if isinstance(proposal, list) else list(proposal)
     return [grader.grade(task, outcome, proposal_list, rationale) for grader in graders]

@@ -16,7 +16,7 @@ A real-world OpenEnv benchmark for **air traffic disruption recovery**. The agen
 - Real-world domain: ATC disruption recovery (not a game)
 - OpenEnv API: typed models + `/reset`, `/step`, `/state`
 - Tasks: 3 deterministic graded tasks (`easy`, `medium`, `hard`)
-- Graders: bounded `0.0-1.0`, deterministic composite score
+- Graders: strictly bounded `(0.0, 1.0)`, deterministic composite score
 - Baseline: root-level `inference.py`, structured `[START]/[STEP]/[END]` logs
 - Infra: Dockerfile + HF Space deployment flow
 
@@ -71,7 +71,7 @@ Defined in `tasks.py`:
 2. `mumbai_bank_balance_medium` (medium)
 3. `bengaluru_irrops_hard` (hard)
 
-All tasks are scored with deterministic and bounded outputs (`0.0-1.0`).
+All tasks are scored with deterministic and strictly bounded outputs (`0.0 < score < 1.0`).
 
 ## Reward and Scoring
 
@@ -235,7 +235,7 @@ python inference.py
 Expected:
 
 - OpenEnv validate: `[OK] : Ready for multi-mode deployment`
-- Grader scores bounded `0.0-1.0`
+- Grader scores strictly bounded `(0.0, 1.0)`
 - Inference logs strictly follow `[START]/[STEP]/[END]`
 - Space responds to `/health` and `/reset`
 
@@ -243,4 +243,4 @@ Expected:
 
 - Deterministic scoring is intentional for reproducibility and anti-gaming.
 - Optional LLM signals are preserved as auxiliary analysis, not official score drivers.
-- Release branch is hackathon-standard focused; Groq-only development artifacts are excluded.
+- Release branch is hackathon-standard focused; provider-specific development artifacts are excluded.
