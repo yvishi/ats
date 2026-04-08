@@ -48,7 +48,7 @@ graph LR
 
 Screenshot from the deployed Hugging Face Space:
 
-![ATC Optimization OpenEnv Space UI](assets/hf-space-console.png)
+![ATC Optimization OpenEnv Space UI](assets/hf-space-console-live.png)
 
 ## Requirement-to-Evidence Matrix
 
