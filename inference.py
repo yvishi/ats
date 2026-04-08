@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -49,23 +50,29 @@ def _step_budget(steps_remaining: int) -> int:
     return min(MAX_STEPS_CAP, max(1, int(steps_remaining)))
 
 
+def _safe_print(msg: str) -> None:
+    """Print to stdout, silently ignoring broken pipe errors."""
+    try:
+        print(msg, flush=True)
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+    _safe_print(f"[START] task={task} env={env} model={model}")
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
     error_text = "null" if error is None else error.replace("\n", " ").strip()
-    print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} done={_bool_token(done)} error={error_text}",
-        flush=True,
+    _safe_print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={_bool_token(done)} error={error_text}"
     )
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_text = ",".join(f"{item:.2f}" for item in rewards)
-    print(
-        f"[END] success={_bool_token(success)} steps={steps} score={score:.2f} rewards={rewards_text}",
-        flush=True,
+    _safe_print(
+        f"[END] success={_bool_token(success)} steps={steps} score={score:.2f} rewards={rewards_text}"
     )
 
 
@@ -267,11 +274,17 @@ async def run_task(client: Optional[OpenAI], base_url: str, task_id: str) -> flo
 
 
 async def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN) if API_BASE_URL and HF_TOKEN else None
-    base_url, process = await prepare_base_url()
+    process: Optional[subprocess.Popen] = None
     try:
+        client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN) if API_BASE_URL and HF_TOKEN else None
+        base_url, process = await prepare_base_url()
         for task_id in TASK_IDS:
             await run_task(client, base_url, task_id)
+    except Exception as exc:
+        try:
+            print(f"[FATAL] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        except (BrokenPipeError, OSError):
+            pass
     finally:
         if process is not None:
             process.terminate()
@@ -282,4 +295,23 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # On Linux, reset SIGPIPE to default so broken-pipe produces a clean exit
+    # instead of a Python exception.  On Windows this signal doesn't exist.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    try:
+        asyncio.run(main())
+    except (BrokenPipeError, OSError, KeyboardInterrupt):
+        pass
+    finally:
+        # Silently close stdout/stderr to avoid secondary BrokenPipeError
+        # during interpreter shutdown.
+        try:
+            sys.stdout.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            sys.stderr.close()
+        except (BrokenPipeError, OSError):
+            pass
