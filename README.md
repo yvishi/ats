@@ -44,6 +44,12 @@ graph LR
 
 **Why this is hard for an LLM:** A naive agent that assigns all slots sequentially scores approximately 0.2 on the medium task because it ignores wake turbulence separation minimums between Heavy/Medium/Light aircraft classes. The grader's 3-layer gate requires the agent to satisfy all hard safety constraints before any efficiency or fairness credit is awarded. The agent must simultaneously reason about separation rules, emergency priority overrides (medical/fuel emergencies jump the queue), airline equity across the bank window, and runway capacity — making this a genuine multi-objective planning problem.
 
+## Live Space Preview
+
+Screenshot from the deployed Hugging Face Space:
+
+![ATC Optimization OpenEnv Space UI](assets/hf-space-console.png)
+
 ## Requirement-to-Evidence Matrix
 
 | Requirement | Evidence |
