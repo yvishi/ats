@@ -268,7 +268,7 @@
       position: absolute;
       left: 12%;
       top: 62%;
-      width: clamp(88px, 13%, 120px);
+      width: clamp(122px, 17%, 190px);
       transform: translate(-50%, -50%) rotate(-6deg);
       transform-origin: 50% 50%;
       filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.35));
@@ -280,12 +280,11 @@
       width: 100%;
     }
 
-    .plane svg { width: 100%; height: auto; display: block; }
-    .plane-body { fill: #f3f5f7; }
-    .plane-wing { fill: #bfc8d0; }
-    .plane-accent { fill: var(--gold); }
-    .plane-tail { fill: #8aa2b7; }
-    .plane-window { fill: #31404d; }
+    .plane img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
 
     .smoke,
     .impact {
@@ -715,15 +714,7 @@
                 <div class="smoke"></div>
                 <div class="impact"></div>
                 <div class="plane">
-                  <svg viewBox="0 0 160 80">
-                    <path class="plane-body" d="M10 42 L60 35 L91 11 L103 15 L90 38 L145 34 L154 40 L145 46 L90 42 L103 65 L91 69 L60 45 L10 38 Z"></path>
-                    <path class="plane-wing" d="M58 35 L95 12 L101 16 L73 39 Z"></path>
-                    <path class="plane-wing" d="M58 45 L95 68 L101 64 L73 41 Z"></path>
-                    <path class="plane-tail" d="M32 37 L15 24 L23 24 L42 36 Z"></path>
-                    <path class="plane-tail" d="M32 43 L15 56 L23 56 L42 44 Z"></path>
-                    <rect class="plane-accent" x="18" y="36" width="16" height="8" rx="3"></rect>
-                    <circle class="plane-window" cx="129" cy="40" r="3"></circle>
-                  </svg>
+                  <img src="__PLANE_IMAGE_SRC__" alt="Passenger aircraft">
                 </div>
               </div>
             </div>

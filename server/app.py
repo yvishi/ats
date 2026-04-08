@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -28,6 +29,7 @@ except ImportError:
 
 
 UI_TEMPLATE_PATH = Path(__file__).with_name("ui_console.html")
+PLANE_IMAGE_PATH = Path(__file__).with_name("ui_aircraft.png")
 
 
 app = create_app(
@@ -60,8 +62,13 @@ def _render_index_html() -> str:
         f'<option value="{model}">{model}</option>'
         for model in ui_runner.MODEL_OPTIONS
     )
+    plane_image_bytes = PLANE_IMAGE_PATH.read_bytes()
+    plane_image_src = (
+        "data:image/png;base64," + base64.b64encode(plane_image_bytes).decode("ascii")
+    )
     return (
         template.replace("__MODEL_OPTIONS__", model_options)
+        .replace("__PLANE_IMAGE_SRC__", plane_image_src)
         .replace("__TASK_DATA__", json.dumps(ui_runner.UI_TASKS))
         .replace("__TASK_STRIPS__", _render_task_strips())
     )
