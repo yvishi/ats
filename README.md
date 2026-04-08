@@ -7,18 +7,42 @@ tags:
   - openenv
 ---
 
+![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-blue)
+![Tasks](https://img.shields.io/badge/tasks-4-green)
+![HF Space](https://img.shields.io/badge/HF%20Space-live-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 # ATC Optimization OpenEnv
 
 A real-world OpenEnv benchmark for **air traffic disruption recovery**. The agent acts as a tactical ATC/flow controller and must build safe, complete runway slot plans under operational pressure (weather, inspections, emergency priorities, bank balancing).
 
 ## Judge Quick View
 
-- Real-world domain: ATC disruption recovery (not a game)
-- OpenEnv API: typed models + `/reset`, `/step`, `/state`
-- Tasks: 4 deterministic graded tasks (`easy`, `medium`, 2× `hard`)
-- Graders: strictly bounded `(0.0, 1.0)`, deterministic 3-layer gated composite score
-- Baseline: root-level `inference.py`, structured `[START]/[STEP]/[END]` logs
-- Infra: Dockerfile + HF Space deployment flow
+| Item | Detail |
+|------|--------|
+| Domain | ATC disruption recovery (real-world, not a game) |
+| OpenEnv API | Typed Pydantic models + `/reset` `/step` `/state` |
+| Tasks | 4 deterministic graded tasks (easy → medium → hard × 2) |
+| Graders | 3-layer gated composite score, strictly bounded 0.0–1.0 |
+| Baseline | Root `inference.py`, structured `[START]/[STEP]/[END]` logs |
+| Benchmark | See `BENCHMARK.md` — agent vs. random baseline across all 4 tasks |
+| Tests | `pytest -q` passes green |
+| Infra | Dockerfile + HF Space: https://huggingface.co/spaces/GTsingh12/ATS-openenv |
+| Architecture | Mermaid diagram in Environment Design section below |
+
+```mermaid
+graph LR
+    A[LLM Agent] -->|ATCOptimizationAction| B[OpenEnv step API]
+    B --> C[ATC Environment\nserver/atc_environment.py]
+    C --> D[Simulation Engine\nengine.py]
+    D --> E[Grader\ngraders.py]
+    E -->|reward 0.0–1.0| F[Observation + Score]
+    F -->|next observation| A
+    C --> G[State\nstate API]
+    G -->|active_task_ids,\nflight states| A
+```
+
+**Why this is hard for an LLM:** A naive agent that assigns all slots sequentially scores approximately 0.2 on the medium task because it ignores wake turbulence separation minimums between Heavy/Medium/Light aircraft classes. The grader's 3-layer gate requires the agent to satisfy all hard safety constraints before any efficiency or fairness credit is awarded. The agent must simultaneously reason about separation rules, emergency priority overrides (medical/fuel emergencies jump the queue), airline equity across the bank window, and runway capacity — making this a genuine multi-objective planning problem.
 
 ## Requirement-to-Evidence Matrix
 
@@ -125,7 +149,7 @@ Root file: `inference.py`
 - emits strict structured logs:
   - `[START] task=<id> env=atc_optimization_openenv model=<model>`
   - `[STEP] step=<n> action=<action> reward=<0.00> done=<true|false> error=<msg|null>`
-  - `[END] success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>`
+  - `[END] task=<id> success=<true|false> steps=<n> score=<0.00> rewards=<r1,r2,...>`
 - deterministic fallback when model output is unavailable/invalid
 - all scores strictly within `(0, 1)` — never exactly 0.0 or 1.0
 
@@ -155,6 +179,8 @@ The 4th task (`hyderabad_cargo_crunch_medium_hard`) is available via the environ
 | `server/atc_environment.py` | `Environment` implementation — reset, step, state |
 | `inference.py` | Required baseline submission script (root) |
 | `openenv.yaml` | OpenEnv environment metadata |
+| `BENCHMARK.md` | Judge-facing benchmark summary with task-by-task comparison table |
+| `results/benchmark_scores.json` | Placeholder runtime/score artifact to fill after running `python inference.py` |
 | `Dockerfile` | Container runtime for HF Space deployment |
 | `pyproject.toml` | Python project config and dependencies |
 | `scripts/run_graders.py` | Task grading check with strict `(0, 1)` assertions |

@@ -11,6 +11,8 @@ tags:
 - openenv
 - air-traffic-control
 - optimization
+action_space: models:ATCOptimizationAction
+observation_space: models:ATCOptimizationObservation
 tasks:
 - id: delhi_monsoon_recovery_easy
   difficulty: easy

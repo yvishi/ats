@@ -24,7 +24,13 @@ def test_log_format_matches_required_field_order(capsys) -> None:
         done=False,
         error=None,
     )
-    inference.log_end(success=True, steps=2, score=0.91, rewards=[0.5, 0.125])
+    inference.log_end(
+        task="task_a",
+        success=True,
+        steps=2,
+        score=0.91,
+        rewards=[0.5, 0.125],
+    )
 
     lines = [line for line in capsys.readouterr().out.strip().splitlines() if line]
     assert lines[0] == "[START] task=task_a env=atc_optimization_openenv model=heuristic-baseline"
@@ -32,7 +38,10 @@ def test_log_format_matches_required_field_order(capsys) -> None:
         lines[1]
         == "[STEP] step=2 action=submit_plan(count=8,commit=false) reward=0.12 done=false error=null"
     )
-    assert lines[2] == "[END] success=true steps=2 score=0.91 rewards=0.50,0.12"
+    assert (
+        lines[2]
+        == "[END] task=task_a success=true steps=2 score=0.91 rewards=0.50,0.12"
+    )
 
 
 def test_extract_json_object_rejects_non_object_payload() -> None:
