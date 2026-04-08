@@ -36,7 +36,7 @@ TASK_IDS = [
     "bengaluru_irrops_hard",
 ]
 SUCCESS_SCORE_THRESHOLD = 0.65
-SCORE_EPSILON = 1e-4
+SCORE_EPSILON = 0.01
 MAX_STEPS_CAP = int(os.getenv("MAX_STEPS_CAP", "4"))
 MAX_TOKENS = 1400
 TEMPERATURE = 0

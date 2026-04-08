@@ -27,7 +27,7 @@ except ImportError:
     from models import PriorityClass, SlotAssignment, TaskDefinition, TaskGrade
 
 
-STRICT_SCORE_EPSILON = 1e-4
+STRICT_SCORE_EPSILON = 0.01
 
 
 def _strict_score(value: float) -> float:
