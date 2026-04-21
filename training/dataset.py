@@ -373,14 +373,37 @@ def _make_supervisor_sample(
 
 # ── Action parsers (completion → typed action) ────────────────────────────────
 
-def _extract_json(text: str) -> Optional[str]:
-    """Extract first JSON object from LLM completion (handles markdown fences)."""
+def _coerce_completion_text(completion: Any) -> str:
+    """Normalise chat-style completions from TRL into plain text."""
+    if completion is None:
+        return ""
+    if isinstance(completion, bytes):
+        return completion.decode("utf-8", errors="ignore")
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, dict):
+        for key in ("content", "text", "completion", "generated_text"):
+            if key in completion:
+                return _coerce_completion_text(completion[key])
+        try:
+            return json.dumps(completion)
+        except Exception:
+            return str(completion)
+    if isinstance(completion, list):
+        parts = [_coerce_completion_text(item) for item in completion]
+        return "\n".join(part for part in parts if part)
+    return str(completion)
+
+
+def _extract_json(text: Any) -> Optional[str]:
+    """Extract first JSON object from an LLM completion."""
+    text = _coerce_completion_text(text)
     text = re.sub(r"```(?:json)?", "", text).strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
     return match.group(0) if match else None
 
 
-def parse_aman_action(completion: str) -> Optional[AMANAction]:
+def parse_aman_action(completion: Any) -> Optional[AMANAction]:
     raw = _extract_json(completion)
     if not raw:
         return None
@@ -411,7 +434,7 @@ def parse_aman_action(completion: str) -> Optional[AMANAction]:
         return None
 
 
-def parse_dman_action(completion: str) -> Optional[DMANAction]:
+def parse_dman_action(completion: Any) -> Optional[DMANAction]:
     raw = _extract_json(completion)
     if not raw:
         return None
@@ -443,7 +466,7 @@ def parse_dman_action(completion: str) -> Optional[DMANAction]:
         return None
 
 
-def parse_generator_action(completion: str) -> Optional[GeneratorAction]:
+def parse_generator_action(completion: Any) -> Optional[GeneratorAction]:
     raw = _extract_json(completion)
     if not raw:
         return None

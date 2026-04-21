@@ -31,6 +31,7 @@ Colab one-liner:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -105,9 +106,9 @@ LORA_TARGETS   = ["q_proj", "v_proj", "k_proj", "o_proj"]
 MAX_SEQ_LEN    = 4096
 MAX_NEW_TOKENS = 512
 TEMPERATURE    = 0.7
-N_GENERATIONS  = 4    # GRPO group size: sample 4 completions per prompt
-BATCH_SIZE     = 1
-GRAD_ACCUM     = 4    # effective batch = 4
+N_GENERATIONS  = 2    # safer default for modern GRPOTrainer on Colab GPUs
+BATCH_SIZE     = 2
+GRAD_ACCUM     = 4
 LR             = 5e-5
 KL_COEFF       = 0.04  # KL penalty coefficient (lower = more exploration)
 WARMUP_RATIO   = 0.05
@@ -130,6 +131,41 @@ def _reward_failure_mode() -> str:
     return mode
 
 
+def _config_supports(param: str, config_cls) -> bool:
+    try:
+        return param in inspect.signature(config_cls.__init__).parameters
+    except Exception:
+        return False
+
+
+def _trainer_supports(param: str, trainer_cls) -> bool:
+    try:
+        return param in inspect.signature(trainer_cls.__init__).parameters
+    except Exception:
+        return False
+
+
+def _resolve_num_generations(batch_size: int, requested: int) -> int:
+    requested = max(1, requested)
+    batch_size = max(1, batch_size)
+    if batch_size % requested == 0:
+        return requested
+    for candidate in range(min(requested, batch_size), 0, -1):
+        if batch_size % candidate == 0:
+            return candidate
+    return 1
+
+
+def _select_sample_value(value: Any, index: int) -> Any:
+    if isinstance(value, list):
+        if not value:
+            return None
+        if index < len(value):
+            return value[index]
+        return value[-1]
+    return value
+
+
 def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     """Unified reward dispatcher — routes to per-role reward function.
 
@@ -137,13 +173,17 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     kwargs contains per-sample metadata from the dataset.
     """
     roles = kwargs.get("agent_role", [AgentRole.AMAN.value] * len(completions))
+    if not isinstance(roles, list):
+        roles = [roles] * len(completions)
+    elif len(roles) < len(completions):
+        roles = roles + [roles[-1] if roles else AgentRole.AMAN.value] * (len(completions) - len(roles))
     rewards: List[float] = []
     failure_mode = _reward_failure_mode()
 
     for i, (completion, role) in enumerate(zip(completions, roles)):
         fn = REWARD_FN_DISPATCH.get(role, aman_reward_fn)
         # Build single-item kwargs for this sample
-        sample_kwargs = {k: [v[i]] if isinstance(v, list) else [v] for k, v in kwargs.items()}
+        sample_kwargs = {k: [_select_sample_value(v, i)] for k, v in kwargs.items()}
         try:
             r = fn([completion], **sample_kwargs)
             if not r:
@@ -171,6 +211,12 @@ def train(
     hub_model_id:  Optional[str] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
+    num_generations = _resolve_num_generations(BATCH_SIZE, N_GENERATIONS)
+    if num_generations != N_GENERATIONS:
+        print(
+            f"[WARN] Adjusting num_generations from {N_GENERATIONS} to {num_generations} "
+            f"to satisfy current GRPO batch-size constraints."
+        )
 
     print(f"\n{'='*60}")
     print(f"  ATC Multi-Agent GRPO Training")
@@ -229,33 +275,38 @@ def train(
         sys.exit(1)
 
     # ── 3. GRPO config ────────────────────────────────────────────────────────
-    print(f"\n[3/5] Configuring GRPO (group_size={N_GENERATIONS})...")
-    grpo_config = GRPOConfig(
-        # Core GRPO
-        num_generations=N_GENERATIONS,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=TEMPERATURE,
-        # Optimisation
-        learning_rate=LR,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        num_train_epochs=1,
-        warmup_ratio=WARMUP_RATIO,
-        # KL penalty (keeps model close to reference)
-        kl_coeff=KL_COEFF,
-        # Logging
-        logging_steps=10,
-        output_dir=output_dir,
-        report_to="wandb" if _wandb_available() else "none",
-        run_name=f"atc-multiagent-grpo-{int(time.time())}",
-        # Memory optimisation for T4
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
-        gradient_checkpointing=True,
-        optim="paged_adamw_8bit",   # 8-bit AdamW saves ~2 GB vs fp32
-        # GRPO specific
-        use_vllm=False,   # vLLM not needed for 7B on T4
-    )
+    print(f"\n[3/5] Configuring GRPO (group_size={num_generations})...")
+    grpo_kwargs = {
+        "num_generations": num_generations,
+        "temperature": TEMPERATURE,
+        "learning_rate": LR,
+        "per_device_train_batch_size": BATCH_SIZE,
+        "gradient_accumulation_steps": GRAD_ACCUM,
+        "num_train_epochs": 1,
+        "warmup_ratio": WARMUP_RATIO,
+        "logging_steps": 10,
+        "output_dir": output_dir,
+        "report_to": "wandb" if _wandb_available() else "none",
+        "run_name": f"atc-multiagent-grpo-{int(time.time())}",
+        "bf16": torch.cuda.is_bf16_supported(),
+        "fp16": not torch.cuda.is_bf16_supported(),
+        "gradient_checkpointing": True,
+        "optim": "paged_adamw_8bit",
+    }
+    if _config_supports("max_completion_length", GRPOConfig):
+        grpo_kwargs["max_completion_length"] = MAX_NEW_TOKENS
+    elif _config_supports("max_new_tokens", GRPOConfig):
+        grpo_kwargs["max_new_tokens"] = MAX_NEW_TOKENS
+
+    if _config_supports("beta", GRPOConfig):
+        grpo_kwargs["beta"] = KL_COEFF
+    elif _config_supports("kl_coeff", GRPOConfig):
+        grpo_kwargs["kl_coeff"] = KL_COEFF
+
+    if _config_supports("use_vllm", GRPOConfig):
+        grpo_kwargs["use_vllm"] = False
+
+    grpo_config = GRPOConfig(**grpo_kwargs)
 
     # ── 4. Build per-role reward logging callbacks ────────────────────────────
     print("\n[4/5] Setting up reward logging callbacks...")
@@ -268,7 +319,11 @@ def train(
         """Logs per-role rewards for training curve visualisation."""
         def __call__(self, completions, **kwargs):
             rewards = combined_reward_fn(completions, **kwargs)
-            roles   = kwargs.get("agent_role", [])
+            roles = kwargs.get("agent_role", [])
+            if not isinstance(roles, list):
+                roles = [roles] * len(rewards)
+            elif len(roles) < len(rewards):
+                roles = roles + [roles[-1] if roles else AgentRole.AMAN.value] * (len(rewards) - len(roles))
             for r, role in zip(rewards, roles):
                 if role in reward_log:
                     reward_log[role].append(r)
@@ -279,13 +334,18 @@ def train(
 
     # ── 5. Train ──────────────────────────────────────────────────────────────
     print("\n[5/5] Starting GRPO training...")
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=reward_logger,
-        config=grpo_config,
-        train_dataset=dataset,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "processing_class": tokenizer,
+        "reward_funcs": reward_logger,
+        "train_dataset": dataset,
+    }
+    if _trainer_supports("args", GRPOTrainer):
+        trainer_kwargs["args"] = grpo_config
+    else:
+        trainer_kwargs["config"] = grpo_config
+
+    trainer = GRPOTrainer(**trainer_kwargs)
 
     trainer.train()
 
