@@ -348,6 +348,8 @@ These sit alongside the normal OpenEnv endpoints and the UI routes.
 python training/train_grpo.py --episodes 200 --output_dir ./outputs/atc-multiagent
 ```
 
+For Google Colab, use the notebook at `training/atc_multiagent_colab.ipynb`.
+
 ### Evaluate a Trained Checkpoint
 
 ```bash
