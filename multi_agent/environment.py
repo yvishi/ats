@@ -387,7 +387,6 @@ class MultiAgentATCEnvironment:
                     delay = abs(slot.assigned_minute - f.scheduled_minute)
                     arr_delay_total += delay
                     if is_emergency:
-                        (emg_arr_ok if delay <= 5 else emg_arr_miss).__class__  # noop
                         if delay <= 5:
                             emg_arr_ok += 1
                         else:
@@ -646,7 +645,8 @@ class MultiAgentATCEnvironment:
         """
         deadlines: Dict[str, int] = {}
         departures = [f for f in task.flights if f.operation == OperationType.DEPARTURE]
-        # Constrain roughly 1/3 of departures with a tight network slot
+        if not departures:
+            return deadlines
         constrained = self._rng.sample(departures, k=max(1, len(departures) // 3))
         for flight in constrained:
             # Deadline = scheduled + 12 min buffer (realistic ATFM GDP window)

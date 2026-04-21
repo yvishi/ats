@@ -351,7 +351,6 @@ class ChallengeGenerator:
         Heuristic: check no flight's window is tighter than minimum separation
         and no runway is overloaded beyond theoretical maximum.
         """
-        from constants import SEPARATION_BY_WAKE
         for f in task.flights:
             if f.latest_minute - f.earliest_minute < 2:
                 return False

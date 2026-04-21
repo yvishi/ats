@@ -50,6 +50,7 @@ except ImportError:
 
 _CATALOG = None
 _SUPERVISOR = SupervisorAgent()
+_GENERATOR = ChallengeGenerator()
 _TRACE_REWARDS = os.getenv("ATC_REWARD_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 _DEFAULT_SUPERVISOR_PROFILE = SupervisorProfileName.SAFETY_STRICT
 
@@ -199,11 +200,10 @@ def aman_reward_fn(
 
         cross_penalty = 0.0
         if {s.runway for s in aman_action.arrival_slots} & {s.runway for s in dman_slots}:
-            cross_outcome = simulate_plan(task, merged)
             cross_penalty = _normalized_cross_conflict_penalty(
                 aman_action.arrival_slots,
                 dman_slots,
-                cross_outcome.metrics.conflict_count,
+                outcome.metrics.conflict_count,
             )
 
         tom_bonus = _compute_tom_bonus_aman(aman_action, dman_slots, task)
@@ -320,11 +320,10 @@ def dman_reward_fn(
 
         cross_penalty = 0.0
         if {s.runway for s in dman_action.departure_slots} & {s.runway for s in aman_slots}:
-            cross_outcome = simulate_plan(task, merged)
             cross_penalty = _normalized_cross_conflict_penalty(
                 dman_action.departure_slots,
                 aman_slots,
-                cross_outcome.metrics.conflict_count,
+                outcome.metrics.conflict_count,
             )
 
         tom_bonus = _compute_tom_bonus_dman(dman_action, aman_slots, task)
@@ -387,9 +386,8 @@ def generator_reward_fn(
             rewards.append(-0.5)
             continue
 
-        generator = ChallengeGenerator()
-        _, is_solvable = generator.mutate(task, gen_action)
-        reward = generator.compute_reward(_safe_float(ctrl_score), is_solvable)
+        _, is_solvable = _GENERATOR.mutate(task, gen_action)
+        reward = _GENERATOR.compute_reward(_safe_float(ctrl_score), is_solvable)
         rewards.append(round(max(-1.0, min(1.0, reward)), 4))
 
     return rewards

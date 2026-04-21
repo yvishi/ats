@@ -206,7 +206,6 @@ def build_episode_dataset(
         mutated_task, is_solvable = generator.mutate(base_task)
 
         aman_obs, dman_obs = env.reset(
-            task_id=mutated_task.task_id if not mutated_task else None,
             episode_id=ep_id,
             supervisor_profile=profile,
             mutated_task=mutated_task,

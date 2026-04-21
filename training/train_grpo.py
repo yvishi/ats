@@ -239,7 +239,7 @@ def train(
         r=lora_rank,
         lora_alpha=LORA_ALPHA,
         target_modules=LORA_TARGETS,
-        lora_dropout=0.05,
+        lora_dropout=0.0,
         bias="none",
         use_gradient_checkpointing="unsloth",  # saves ~30% VRAM
         random_state=seed,
@@ -316,8 +316,18 @@ def train(
     }
 
     class RewardLogger:
-        """Logs per-role rewards for training curve visualisation."""
-        def __call__(self, completions, **kwargs):
+        __name__ = "combined_reward_fn"
+
+        def __call__(self, *args, **kwargs):
+            # TRL <0.17: reward_func(completions=..., **kwargs)
+            # TRL >=0.17: reward_func(prompts, completions, **kwargs)
+            if len(args) >= 2:
+                completions = args[1]
+            elif args:
+                completions = args[0]
+            else:
+                completions = kwargs.pop("completions", [])
+            kwargs.pop("prompts", None)
             rewards = combined_reward_fn(completions, **kwargs)
             roles = kwargs.get("agent_role", [])
             if not isinstance(roles, list):
@@ -337,7 +347,7 @@ def train(
     trainer_kwargs = {
         "model": model,
         "processing_class": tokenizer,
-        "reward_funcs": reward_logger,
+        "reward_funcs": [reward_logger],
         "train_dataset": dataset,
     }
     if _trainer_supports("args", GRPOTrainer):
