@@ -57,6 +57,8 @@ FLOOR_THRESHOLD      = 0.30   # ease back when agents consistently below this
 EMA_ALPHA            = 0.2    # exponential moving average smoothing factor
 MAX_MUTATIONS_PER_EPISODE = 3 # cap mutations to keep scenarios solvable
 MIN_WINDOW_WIDTH     = 8      # never squeeze window below 8 minutes
+MASTERY_WINDOW       = 10     # rolling window for per-scenario success rate
+MASTERY_THRESHOLD    = 0.55   # rate below this → mutation considered "weak"/underused
 
 
 class ChallengeGenerator:
@@ -72,6 +74,12 @@ class ChallengeGenerator:
         self._difficulty_level: int = 1    # 1=easy mutations → 6=max chaos
         self._score_history: Deque[float] = deque(maxlen=10)
         self._mutation_history: List[Dict] = []
+        # Per-scenario mastery: track agent success rate per task_id and mutation_type
+        self._task_mastery: Dict[str, Deque[float]] = {}
+        self._mutation_mastery: Dict[str, Deque[float]] = {}
+        # PAIRED: store baseline score for last mutated task to compute regret reward
+        self._last_heuristic_score: float = 0.5
+        self._last_mutated_task: Optional[TaskDefinition] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -85,6 +93,58 @@ class ChallengeGenerator:
         elif self._ema_score < FLOOR_THRESHOLD and self._difficulty_level > 1:
             self._difficulty_level -= 1
 
+    def record(
+        self,
+        task_id: str,
+        mutations_used: Optional[List[str]],
+        composite_score: float,
+    ) -> None:
+        """Record per-scenario mastery after an episode completes.
+
+        Called by the training loop alongside update(). Maintains rolling success
+        rate per task_id and per mutation_type so the generator can identify which
+        mutations the agents have mastered and which still challenge them.
+        """
+        if task_id not in self._task_mastery:
+            self._task_mastery[task_id] = deque(maxlen=MASTERY_WINDOW)
+        self._task_mastery[task_id].append(composite_score)
+
+        for mtype in (mutations_used or []):
+            if mtype not in self._mutation_mastery:
+                self._mutation_mastery[mtype] = deque(maxlen=MASTERY_WINDOW)
+            self._mutation_mastery[mtype].append(composite_score)
+
+    def get_weak_mutations(self, threshold: float = MASTERY_THRESHOLD) -> List[str]:
+        """Return mutation types where agents still score below threshold on average.
+
+        Used by _sample_mutations() to boost under-explored challenge types.
+        """
+        weak = []
+        for mtype, scores in self._mutation_mastery.items():
+            if len(scores) >= 3 and (sum(scores) / len(scores)) < threshold:
+                weak.append(mtype)
+        return weak
+
+    def mastery_report(self) -> Dict:
+        """Summary of per-task and per-mutation success rates for logging."""
+        task_means = {
+            tid: round(sum(v) / len(v), 3)
+            for tid, v in self._task_mastery.items()
+            if v
+        }
+        mut_means = {
+            mtype: round(sum(v) / len(v), 3)
+            for mtype, v in self._mutation_mastery.items()
+            if v
+        }
+        return {
+            "task_mastery": task_means,
+            "mutation_mastery": mut_means,
+            "weak_mutations": self.get_weak_mutations(),
+            "difficulty_level": self._difficulty_level,
+            "ema_score": self.ema_score,
+        }
+
     def mutate(
         self,
         base_task: TaskDefinition,
@@ -94,6 +154,8 @@ class ChallengeGenerator:
 
         If generator_action is provided (LLM-driven), apply those mutations.
         Otherwise fall back to rule-based mutations matching current difficulty.
+        Also stores the scheduled-baseline score on the mutated task for PAIRED
+        regret computation in compute_reward().
         """
         task = self._deep_copy_task(base_task)
 
@@ -111,17 +173,35 @@ class ChallengeGenerator:
             })
 
         solvable = self._check_solvability(task)
+
+        # PAIRED: cache heuristic baseline on mutated task so compute_reward()
+        # can compute regret = controller_score - baseline_score.
+        self._last_mutated_task = task
+        self._last_heuristic_score = self._score_scheduled_baseline(task) if solvable else 0.0
+
         return task, solvable
 
     def compute_reward(self, controller_score: float, is_solvable: bool) -> float:
-        """Generator reward: adversarial with solvability guard.
+        """Generator reward: PAIRED regret-based with solvability guard.
 
         Unsolvable scenarios get penalised — generator must create HARD but
         not IMPOSSIBLE challenges (mirrors real ATC simulator design).
+
+        When a baseline score is available (after mutate() was called this episode),
+        uses PAIRED regret = controller_score − heuristic_baseline so the generator
+        is rewarded for staying at the frontier of agent capability, not just for
+        making tasks arbitrarily hard.
         """
         if not is_solvable:
             return -1.0
-        # Zero-sum adversarial reward; clipped to avoid extreme values
+
+        if self._last_mutated_task is not None:
+            # PAIRED regret: positive when agents beat baseline (bad for generator),
+            # negative when agents fall behind baseline (generator rewarded).
+            regret = controller_score - self._last_heuristic_score
+            return round(max(-1.0, min(1.0, -regret)), 4)
+
+        # Fallback if called without prior mutate() (e.g. unit tests)
         return round(max(-1.0, min(1.0, 1.0 - controller_score)), 4)
 
     @property
@@ -135,7 +215,11 @@ class ChallengeGenerator:
     # ── Mutation sampling ─────────────────────────────────────────────────────
 
     def _sample_mutations(self, task: TaskDefinition) -> List[GeneratorMutation]:
-        """Rule-based mutation selection based on current difficulty level."""
+        """Rule-based mutation selection based on current difficulty level.
+
+        Mutations whose type appears in get_weak_mutations() are boosted 3x in
+        the sampling pool, steering the curriculum toward underexplored challenges.
+        """
         mutations: List[GeneratorMutation] = []
 
         level = self._difficulty_level
@@ -155,6 +239,11 @@ class ChallengeGenerator:
             pool += [MutationType.ADD_CONFLICTING_FLIGHT] * 2
         if level >= 6:
             pool += [MutationType.CLOSE_RUNWAY_WINDOW] * 1
+
+        # Boost weak mutations: add 2 extra copies (3x total) for each type that
+        # the agents haven't mastered yet, so the curriculum focuses there.
+        weak = set(self.get_weak_mutations())
+        pool += [mt for mt in pool if mt.value in weak]
 
         selected = self._rng.choices(pool, k=n_mutations)
 
@@ -373,6 +462,31 @@ class ChallengeGenerator:
                 return False
 
         return True
+
+    def _score_scheduled_baseline(self, task: TaskDefinition) -> float:
+        """Compute the 'do nothing' baseline score for PAIRED regret calculation.
+
+        Assigns every flight to its scheduled_minute (clamped to window) on the
+        first allowed runway — the simplest possible plan with no optimisation.
+        The difference between controller_score and this baseline is the regret
+        signal: generator is rewarded for scenarios where agents can't beat naive.
+        """
+        slots = []
+        for f in task.flights:
+            if not f.allowed_runways:
+                continue
+            minute = max(f.earliest_minute, min(f.latest_minute, f.scheduled_minute))
+            slots.append(SlotAssignment(
+                flight_id=f.flight_id,
+                runway=f.allowed_runways[0],
+                assigned_minute=minute,
+                hold_minutes=0,
+            ))
+        try:
+            outcome = simulate_plan(task, slots)
+            return outcome.normalized_score
+        except Exception:
+            return 0.5  # fallback: treat as mid-quality baseline
 
     def _deep_copy_task(self, task: TaskDefinition) -> TaskDefinition:
         return TaskDefinition.model_validate(task.model_dump())

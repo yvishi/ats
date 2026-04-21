@@ -24,7 +24,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -367,6 +367,21 @@ def _llm_action(
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
 
+def _save_transcript(
+    transcript_dir: Path,
+    episode_id: int,
+    data: Dict[str, Any],
+) -> None:
+    """Write one episode transcript to <transcript_dir>/episode_NNNNN.json."""
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    path = transcript_dir / f"episode_{episode_id:05d}.json"
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, default=str)
+    except OSError as exc:
+        _p(f"[WARN] Could not save transcript for episode {episode_id}: {exc}")
+
+
 def run_episode(
     task_id: str,
     client,
@@ -376,27 +391,44 @@ def run_episode(
     episode_id: int,
     use_generator: bool = True,
     model_name: Optional[str] = None,
+    transcript_dir: Optional[Path] = None,
 ) -> Dict:
-    """Run one full AMAN/DMAN episode. Returns result dict for logging."""
+    """Run one full AMAN/DMAN episode. Returns result dict for logging.
+
+    Args:
+        transcript_dir: If set, writes a JSON transcript of the full episode
+            (actions, messages, rewards, metadata) to this directory.
+    """
     catalog  = task_catalog()
     base_task = catalog.get(task_id, list(catalog.values())[0])
     profile   = supervisor.sample_profile(episode_id)
     sup_desc  = SUPERVISOR_PROFILES[profile]["description"]
 
+    mutations_applied: List[str] = []
     if use_generator and generator is not None:
         mutated_task, solvable = generator.mutate(base_task)
         gen_difficulty = generator.difficulty_level
+        mutations_applied = [
+            m.mutation_type.value
+            for m in getattr(generator, "_mutation_history", [])[-3:]
+        ]
     else:
         mutated_task, solvable = base_task, True
         gen_difficulty = 1
 
+    # Enable domain randomisation when the generator is inactive — replaces the
+    # structural diversity that generator mutations would otherwise provide.
     aman_obs, dman_obs = env.reset(
         episode_id=episode_id,
         supervisor_profile=profile,
         mutated_task=mutated_task,
+        randomize=not use_generator,
     )
     selected_model = model_name or MODEL_NAME
     atfm = env._state.atfm_deadlines
+
+    # Accumulate round data for the transcript
+    rounds: List[Dict[str, Any]] = []
 
     # ── Round 0: BID ──────────────────────────────────────────────────────────
     aman_action = (
@@ -412,9 +444,19 @@ def run_episode(
     n_conflicts_before = len(env._state.conflict_log)
     log_step(1, "BID", partial_r, n_conflicts_before, done)
 
+    rounds.append({
+        "round": "BID",
+        "partial_reward": partial_r,
+        "conflicts_detected": n_conflicts_before,
+        "aman_slots": len(aman_action.arrival_slots),
+        "dman_slots": len(dman_action.departure_slots),
+        "aman_messages": len(aman_action.outgoing_messages),
+        "dman_messages": len(dman_action.outgoing_messages),
+        "done": done,
+    })
+
     # ── Round 1: NEGOTIATE (if conflicts) ─────────────────────────────────────
     if not done:
-        # Re-plan with conflict info + incoming messages
         aman_action2 = (
             _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs2, sup_desc, AgentRole.AMAN)
             or _build_aman_heuristic(aman_obs2)
@@ -430,13 +472,28 @@ def run_episode(
         log_neg(1, resolved, total_msgs)
         log_step(2, "NEGOTIATE", partial_r2, n_conflicts_after, True)
 
+        rounds.append({
+            "round": "NEGOTIATE",
+            "partial_reward": partial_r2,
+            "conflicts_before": n_conflicts_before,
+            "conflicts_after": n_conflicts_after,
+            "conflicts_resolved": resolved,
+            "total_messages": total_msgs,
+            "aman_alternatives_offered": sum(
+                len(m.proposed_alternatives) for m in aman_action2.outgoing_messages
+            ),
+            "dman_alternatives_offered": sum(
+                len(m.proposed_alternatives) for m in dman_action2.outgoing_messages
+            ),
+        })
+
     # ── Finalize ──────────────────────────────────────────────────────────────
     result = env.finalize()
     if generator is not None:
         generator.update(result.composite_score)
         gen_difficulty = generator.difficulty_level
 
-    return {
+    episode_result = {
         "composite":      result.composite_score,
         "aman_reward":    result.aman_reward,
         "dman_reward":    result.dman_reward,
@@ -450,6 +507,36 @@ def run_episode(
         "supervisor":     profile.value,
         "solvable":       solvable,
     }
+
+    if transcript_dir is not None:
+        _save_transcript(
+            transcript_dir,
+            episode_id,
+            {
+                "episode_id":        episode_id,
+                "task_id":           task_id,
+                "supervisor_profile": profile.value,
+                "gen_difficulty":    gen_difficulty,
+                "mutations_applied": mutations_applied,
+                "solvable":          solvable,
+                "rounds":            rounds,
+                "final": {
+                    "composite_score":    result.composite_score,
+                    "aman_reward":        result.aman_reward,
+                    "dman_reward":        result.dman_reward,
+                    "generator_reward":   result.generator_reward,
+                    "supervisor_score":   result.supervisor_score,
+                    "coordination_score": result.per_role.coordination_score,
+                    "cross_lane_conflicts": result.per_role.cross_lane_conflicts,
+                    "negotiation_rounds": result.negotiation_rounds,
+                    "atfm_violations":    result.per_role.atfm_violations,
+                    "emergency_arrivals_ok":   result.per_role.emergency_arrivals_ok,
+                    "emergency_departures_ok": result.per_role.emergency_departures_ok,
+                },
+            },
+        )
+
+    return episode_result
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -467,6 +554,9 @@ def main() -> None:
     parser.add_argument("--all_tasks", action="store_true",
                         help="Run all tasks in sequence")
     parser.add_argument("--seed",     type=int, default=42)
+    parser.add_argument("--transcript_dir", default=None,
+                        help="Directory to write per-episode JSON transcripts "
+                             "(default: no transcripts saved)")
     args = parser.parse_args()
 
     model = args.model or MODEL_NAME
@@ -491,6 +581,8 @@ def main() -> None:
         else [args.task]
     )
 
+    transcript_dir = Path(args.transcript_dir) if args.transcript_dir else None
+
     all_results: List[Dict] = []
 
     for task_id in task_ids:
@@ -505,6 +597,7 @@ def main() -> None:
                 supervisor=supervisor,
                 episode_id=ep,
                 use_generator=not args.no_generator,
+                transcript_dir=transcript_dir,
             )
             success = result["composite"] >= SUCCESS_THRESHOLD
             log_end(

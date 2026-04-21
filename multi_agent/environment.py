@@ -79,6 +79,12 @@ except ImportError:
 MAX_NEGOTIATE_ROUNDS = 2   # max negotiation passes before forced merge
 ATFM_DEADLINE_HEADROOM = 8  # minutes of margin to call an ATFM violation
 
+# Domain randomization bounds — small perturbations to prevent task memorisation
+_RAND_WINDOW_DELTA  = 5    # ± minutes applied to flight windows
+_RAND_WEATHER_DELTA = 0.08  # ± weather_penalty (clipped to [1.0, 1.8])
+_RAND_BUDGET_SCALE  = 0.12  # ± fraction applied to delay_budget / fuel_budget
+_RAND_MIN_WINDOW    = 10    # never squeeze window below this width (minutes)
+
 
 @dataclass
 class EpisodeState:
@@ -131,14 +137,25 @@ class MultiAgentATCEnvironment:
         episode_id: int = 0,
         supervisor_profile: Optional[SupervisorProfileName] = None,
         mutated_task: Optional[TaskDefinition] = None,
+        randomize: bool = False,
     ) -> Tuple[MultiAgentObservation, MultiAgentObservation]:
-        """Reset environment. Returns (aman_obs, dman_obs)."""
+        """Reset environment. Returns (aman_obs, dman_obs).
+
+        Args:
+            randomize: When True (training with no generator), applies bounded
+                parametric perturbations to flight windows and runway weather so
+                agents cannot memorise exact task parameters across episodes.
+                Off by default to keep evaluation and tests deterministic.
+        """
         if mutated_task is not None:
             task = mutated_task
         elif task_id and task_id in self._catalog:
             task = self._catalog[task_id]
         else:
             task = self._rng.choice(list(self._catalog.values()))
+
+        if randomize:
+            task = self._randomize_task(task, episode_id)
 
         profile = supervisor_profile or self._supervisor.sample_profile(episode_id)
         atfm = self._build_atfm_deadlines(task)
@@ -273,23 +290,26 @@ class MultiAgentATCEnvironment:
             all_runways=state.task.runways,
             supervisor_profile_name=profile_name,
             supervisor_description=sup_desc,
-            atfm_deadlines=state.atfm_deadlines,
             conflict_log=conflict_log,
             round_type=round_type,
             round_number=state.round_number,
             steps_remaining=MAX_NEGOTIATE_ROUNDS - state.round_number,
         )
 
+        # Partial observability: ATFM deadlines are DMAN-only information.
+        # AMAN has no visibility into network slot constraints for departures.
         aman_obs = MultiAgentObservation(
             role=AgentRole.AMAN,
             my_flights=arrivals,
             incoming_messages=incoming_aman,
+            atfm_deadlines={},
             **shared,
         )
         dman_obs = MultiAgentObservation(
             role=AgentRole.DMAN,
             my_flights=departures,
             incoming_messages=incoming_dman,
+            atfm_deadlines=state.atfm_deadlines,
             **shared,
         )
         return aman_obs, dman_obs
@@ -478,6 +498,7 @@ class MultiAgentATCEnvironment:
           - Pre-emptive gap left for known DMAN emergency (+0.25)
           - Resolved in fewest negotiation rounds (+0.2 if 0 rounds, +0.1 if 1)
           - Zero cross-lane conflicts (+0.25)
+          - Proposed alternatives that were adopted in the final plan (+0.15)
         """
         score = 0.0
 
@@ -492,17 +513,13 @@ class MultiAgentATCEnvironment:
             score += 0.10
 
         # Emergency handling quality
-        flights_by_id = {f.flight_id: f for f in state.task.flights}
         emergency_flights = [
             f for f in state.task.flights
             if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
         ]
         if emergency_flights:
-            handled = sum(
-                1 for f in emergency_flights
-                if f.flight_id in {s.flight_id for s in state.aman_slots + state.dman_slots}
-            )
-            ratio = handled / len(emergency_flights)
+            assigned_ids = {s.flight_id for s in state.aman_slots + state.dman_slots}
+            ratio = sum(1 for f in emergency_flights if f.flight_id in assigned_ids) / len(emergency_flights)
             score += 0.30 * ratio
 
         # Pre-emptive coordination: DMAN broadcast emergency AND AMAN left gap
@@ -510,11 +527,8 @@ class MultiAgentATCEnvironment:
         if dman_broadcasts:
             aman_runway_minutes = {(s.runway, s.assigned_minute) for s in state.aman_slots}
             for fid in dman_broadcasts:
-                dep_slot = next(
-                    (s for s in state.dman_slots if s.flight_id == fid), None
-                )
+                dep_slot = next((s for s in state.dman_slots if s.flight_id == fid), None)
                 if dep_slot:
-                    # Check no AMAN slot within 5 min of this dep slot on same runway
                     clear = all(
                         abs(m - dep_slot.assigned_minute) >= 3
                         for (rwy, m) in aman_runway_minutes
@@ -523,6 +537,16 @@ class MultiAgentATCEnvironment:
                     if clear:
                         score += 0.25
                         break
+
+        # Reward proposed alternatives that were actually adopted in the final plan.
+        # This incentivises agents to offer concrete fallbacks, not just claim slots.
+        final_slots = {(s.flight_id, s.runway) for s in state.aman_slots + state.dman_slots}
+        all_messages = state.aman_messages + state.dman_messages
+        for msg in all_messages:
+            for alt in msg.proposed_alternatives:
+                if (alt.flight_id, alt.runway_id) in final_slots:
+                    score += 0.15
+                    break  # one bonus per message at most
 
         return round(min(1.0, score), 4)
 
@@ -634,6 +658,48 @@ class MultiAgentATCEnvironment:
             + fuel_adj
         )
         return round(max(0.0, min(1.0, raw)), 4)
+
+    # ── Domain randomisation ──────────────────────────────────────────────────
+
+    def _randomize_task(self, task: TaskDefinition, episode_id: int) -> TaskDefinition:
+        """Apply bounded parametric perturbations to prevent task memorisation.
+
+        Uses a deterministic seed derived from (task_id, episode_id) so results
+        are reproducible for a given episode while varying across episodes.
+        All perturbations are small enough that solvability is preserved.
+        """
+        seed = hash(f"{task.task_id}:{episode_id}") & 0x7FFFFFFF
+        rng = random.Random(seed)
+
+        # Perturb flight windows — shift each bound by ±_RAND_WINDOW_DELTA minutes
+        updated_flights = []
+        for f in task.flights:
+            delta_e = rng.randint(-_RAND_WINDOW_DELTA, _RAND_WINDOW_DELTA)
+            delta_l = rng.randint(-_RAND_WINDOW_DELTA, _RAND_WINDOW_DELTA)
+            new_earliest = max(0, f.earliest_minute + delta_e)
+            new_latest = max(new_earliest + _RAND_MIN_WINDOW, f.latest_minute + delta_l)
+            updated_flights.append(
+                f.model_copy(update={"earliest_minute": new_earliest, "latest_minute": new_latest})
+            )
+
+        # Perturb runway weather penalties
+        updated_runways = []
+        for rwy in task.runways:
+            delta_w = rng.uniform(-_RAND_WEATHER_DELTA, _RAND_WEATHER_DELTA)
+            new_penalty = round(min(1.8, max(1.0, rwy.weather_penalty + delta_w)), 3)
+            updated_runways.append(rwy.model_copy(update={"weather_penalty": new_penalty}))
+
+        # Perturb budgets
+        budget_scale = 1.0 + rng.uniform(-_RAND_BUDGET_SCALE, _RAND_BUDGET_SCALE)
+        new_delay_budget = max(30, int(task.delay_budget * budget_scale))
+        new_fuel_budget = max(50.0, round(task.fuel_budget * budget_scale, 1))
+
+        return task.model_copy(update={
+            "flights":       updated_flights,
+            "runways":       updated_runways,
+            "delay_budget":  new_delay_budget,
+            "fuel_budget":   new_fuel_budget,
+        })
 
     # ── ATFM deadline generator ───────────────────────────────────────────────
 

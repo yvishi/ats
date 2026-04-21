@@ -208,13 +208,21 @@ def aman_reward_fn(
 
         tom_bonus = _compute_tom_bonus_aman(aman_action, dman_slots, task)
         sup_align = _supervisor_alignment(outcome, task, profile)
+        rationale_score = _score_rationale_quality(aman_action.rationale, task, outcome)
+
+        # Counterfactual credit: how much does AMAN's plan improve over naive baseline?
+        # cf_outcome = naive arrivals + real DMAN slots; advantage = real - counterfactual.
+        cf_outcome = simulate_plan(task, _naive_arrival_slots(task) + dman_slots)
+        cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         reward = (
-            0.35 * delay_eff
-            + 0.25 * emg_score
-            + 0.20 * coverage
+            0.26 * delay_eff
+            + 0.20 * emg_score
+            + 0.17 * coverage
+            + 0.12 * cf_advantage
             + 0.10 * tom_bonus
             + 0.05 * sup_align
+            + 0.05 * rationale_score
             - cross_penalty
         )
         reward = round(max(-1.0, min(1.0, reward)), 4)
@@ -224,8 +232,10 @@ def aman_reward_fn(
                 "delay_eff": delay_eff,
                 "emg_score": emg_score,
                 "coverage": coverage,
+                "cf_advantage": cf_advantage,
                 "tom_bonus": tom_bonus,
                 "sup_align": sup_align,
+                "rationale_score": rationale_score,
                 "cross_penalty": -cross_penalty,
                 "final_reward": reward,
             },
@@ -328,14 +338,22 @@ def dman_reward_fn(
 
         tom_bonus = _compute_tom_bonus_dman(dman_action, aman_slots, task)
         sup_align = _supervisor_alignment(outcome, task, profile)
+        rationale_score = _score_rationale_quality(dman_action.rationale, task, outcome)
+
+        # Counterfactual credit: how much does DMAN's plan improve over naive baseline?
+        # cf_outcome = real AMAN slots + naive departures; advantage = real - counterfactual.
+        cf_outcome = simulate_plan(task, aman_slots + _naive_departure_slots(task))
+        cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         reward = (
-            0.30 * delay_eff
-            + 0.20 * atfm_score
-            + 0.20 * emg_score
-            + 0.15 * coverage
+            0.23 * delay_eff
+            + 0.17 * atfm_score
+            + 0.16 * emg_score
+            + 0.12 * coverage
+            + 0.12 * cf_advantage
             + 0.10 * tom_bonus
             + 0.05 * sup_align
+            + 0.05 * rationale_score
             - cross_penalty
         )
         reward = round(max(-1.0, min(1.0, reward)), 4)
@@ -346,8 +364,10 @@ def dman_reward_fn(
                 "atfm_score": atfm_score,
                 "emg_score": emg_score,
                 "coverage": coverage,
+                "cf_advantage": cf_advantage,
                 "tom_bonus": tom_bonus,
                 "sup_align": sup_align,
+                "rationale_score": rationale_score,
                 "cross_penalty": -cross_penalty,
                 "final_reward": reward,
             },
@@ -444,6 +464,98 @@ def supervisor_reward_fn(
         rewards.append(round(min(1.0, score + calibration_bonus), 4))
 
     return rewards
+
+
+def _score_rationale_quality(
+    rationale: str,
+    task: TaskDefinition,
+    outcome,
+) -> float:
+    """Rule-based rationale quality scorer — fully verifiable, no LLM required.
+
+    Rewards agents for rationales that demonstrate awareness of the task's key
+    constraints. Keeps rewards in RLVR territory (deterministic & verifiable).
+
+    Returns a score in [0.0, 1.0].
+    """
+    if not rationale or not rationale.strip():
+        return 0.0
+
+    text = rationale.lower()
+    score = 0.0
+
+    # Acknowledge emergency / medical flights by ID
+    emergency_flights = [
+        f for f in task.flights
+        if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+    ]
+    for ef in emergency_flights:
+        if ef.flight_id.lower() in text:
+            score += 0.20
+            break  # one bonus regardless of how many emergencies are mentioned
+
+    # Acknowledge wake turbulence separation constraints
+    if any(kw in text for kw in ("wake", "turbulence", "separation", "heavy", "light")):
+        score += 0.15
+
+    # Acknowledge runway capacity or weather penalty
+    if any(kw in text for kw in ("capacity", "weather", "penalty", "runway")):
+        score += 0.10
+
+    # Mention at least one flight ID from the task (shows engagement, not boilerplate)
+    flight_ids_lower = {f.flight_id.lower() for f in task.flights}
+    if any(fid in text for fid in flight_ids_lower):
+        score += 0.10
+
+    # Acknowledge a detected conflict if one exists
+    if outcome.metrics.conflict_count > 0 and any(
+        kw in text for kw in ("conflict", "spac", "gap", "collision")
+    ):
+        score += 0.15
+
+    # Mention delay or fuel concern (shows cost awareness)
+    if any(kw in text for kw in ("delay", "fuel", "hold", "burn", "cost")):
+        score += 0.10
+
+    # Penalty for suspiciously short rationales (< 15 chars after strip)
+    if len(rationale.strip()) < 15:
+        score = max(0.0, score - 0.30)
+
+    return round(min(1.0, score), 4)
+
+
+def _naive_arrival_slots(task: TaskDefinition) -> List[SlotAssignment]:
+    """Baseline arrivals plan: each flight at scheduled_minute on first allowed runway.
+
+    Used for COMA-style counterfactual credit assignment — measures how much better
+    AMAN's plan is versus a naive do-nothing scheduler.
+    """
+    slots = []
+    for f in task.flights:
+        if f.operation == OperationType.ARRIVAL and f.allowed_runways:
+            minute = max(f.earliest_minute, min(f.latest_minute, f.scheduled_minute))
+            slots.append(SlotAssignment(
+                flight_id=f.flight_id,
+                runway=f.allowed_runways[0],
+                assigned_minute=minute,
+                hold_minutes=0,
+            ))
+    return slots
+
+
+def _naive_departure_slots(task: TaskDefinition) -> List[SlotAssignment]:
+    """Baseline departures plan: each flight at scheduled_minute on first allowed runway."""
+    slots = []
+    for f in task.flights:
+        if f.operation == OperationType.DEPARTURE and f.allowed_runways:
+            minute = max(f.earliest_minute, min(f.latest_minute, f.scheduled_minute))
+            slots.append(SlotAssignment(
+                flight_id=f.flight_id,
+                runway=f.allowed_runways[0],
+                assigned_minute=minute,
+                hold_minutes=0,
+            ))
+    return slots
 
 
 def _parse_slots_json(json_str: str) -> List[SlotAssignment]:
