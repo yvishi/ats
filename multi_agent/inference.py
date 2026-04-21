@@ -337,6 +337,7 @@ def _build_dman_heuristic(
 
 def _llm_action(
     client,
+    model_name: str,
     system: str,
     obs: MultiAgentObservation,
     sup_desc: str,
@@ -347,7 +348,7 @@ def _llm_action(
     from openai import OpenAI, APIError
     try:
         resp = client.chat.completions.create(
-            model=MODEL_NAME,
+            model=model_name,
             messages=[
                 {"role": "system", "content": system + f"\n\nSUPERVISOR TODAY: {sup_desc}"},
                 {"role": "user",   "content": obs.to_prompt_text()},
@@ -374,6 +375,7 @@ def run_episode(
     supervisor: SupervisorAgent,
     episode_id: int,
     use_generator: bool = True,
+    model_name: Optional[str] = None,
 ) -> Dict:
     """Run one full AMAN/DMAN episode. Returns result dict for logging."""
     catalog  = task_catalog()
@@ -393,15 +395,16 @@ def run_episode(
         supervisor_profile=profile,
         mutated_task=mutated_task,
     )
+    selected_model = model_name or MODEL_NAME
     atfm = env._state.atfm_deadlines
 
     # ── Round 0: BID ──────────────────────────────────────────────────────────
     aman_action = (
-        _llm_action(client, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
+        _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
         or _build_aman_heuristic(aman_obs)
     )
     dman_action = (
-        _llm_action(client, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
+        _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
         or _build_dman_heuristic(dman_obs, atfm)
     )
 
@@ -413,11 +416,11 @@ def run_episode(
     if not done:
         # Re-plan with conflict info + incoming messages
         aman_action2 = (
-            _llm_action(client, AMAN_SYSTEM, aman_obs2, sup_desc, AgentRole.AMAN)
+            _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs2, sup_desc, AgentRole.AMAN)
             or _build_aman_heuristic(aman_obs2)
         )
         dman_action2 = (
-            _llm_action(client, DMAN_SYSTEM, dman_obs2, sup_desc, AgentRole.DMAN)
+            _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs2, sup_desc, AgentRole.DMAN)
             or _build_dman_heuristic(dman_obs2, atfm)
         )
         aman_obs3, dman_obs3, partial_r2, _ = env.step_negotiate(aman_action2, dman_action2)
@@ -496,6 +499,7 @@ def main() -> None:
             result = run_episode(
                 task_id=task_id,
                 client=client,
+                model_name=model,
                 env=env,
                 generator=generator,
                 supervisor=supervisor,

@@ -20,12 +20,12 @@ where kwargs carries per-sample metadata packed into the dataset.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional
 
 try:
     from ..engine import simulate_plan
-    from ..graders import grade_task
     from ..models import OperationType, PriorityClass, SlotAssignment, TaskDefinition
     from ..tasks import task_catalog
     from .dataset import parse_aman_action, parse_dman_action, parse_generator_action
@@ -42,7 +42,6 @@ except ImportError:
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from engine import simulate_plan
-    from graders import grade_task
     from models import OperationType, PriorityClass, SlotAssignment, TaskDefinition
     from tasks import task_catalog
     from training.dataset import parse_aman_action, parse_dman_action, parse_generator_action
@@ -58,6 +57,15 @@ except ImportError:
 
 _CATALOG = None
 _SUPERVISOR = SupervisorAgent()
+_TRACE_REWARDS = os.getenv("ATC_REWARD_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_reward_trace(role: str, components: Dict[str, float]) -> None:
+    if not _TRACE_REWARDS:
+        return
+    print(f"\n[REWARD TRACE] role={role}")
+    for key, value in components.items():
+        print(f"  {key}: {value:.4f}")
 
 
 def _get_catalog() -> Dict[str, TaskDefinition]:
@@ -65,6 +73,34 @@ def _get_catalog() -> Dict[str, TaskDefinition]:
     if _CATALOG is None:
         _CATALOG = task_catalog()
     return _CATALOG
+
+
+def _normalized_cross_conflict_penalty(
+    our_slots: List[SlotAssignment],
+    other_slots: List[SlotAssignment],
+    conflict_count: int,
+    weight: float = 0.35,
+) -> float:
+    if conflict_count <= 0 or not our_slots or not other_slots:
+        return 0.0
+
+    our_by_runway: Dict[str, int] = {}
+    other_by_runway: Dict[str, int] = {}
+
+    for slot in our_slots:
+        our_by_runway[slot.runway] = our_by_runway.get(slot.runway, 0) + 1
+    for slot in other_slots:
+        other_by_runway[slot.runway] = other_by_runway.get(slot.runway, 0) + 1
+
+    max_cross_conflicts = 0
+    for runway in set(our_by_runway) & set(other_by_runway):
+        max_cross_conflicts += our_by_runway[runway] * other_by_runway[runway]
+
+    if max_cross_conflicts <= 0:
+        return 0.0
+
+    normalized = min(1.0, conflict_count / max_cross_conflicts)
+    return weight * normalized
 
 
 # ── AMAN reward function ──────────────────────────────────────────────────────
@@ -85,7 +121,7 @@ def aman_reward_fn(
     catalog = _get_catalog()
     rewards: List[float] = []
 
-    for completion, tid, profile_str, dman_json, atfm_json in zip(
+    for completion, tid, profile_str, dman_json, _atfm_json in zip(
         completions, task_id, supervisor_profile, dman_slots_json, atfm_deadlines_json
     ):
         task = catalog.get(tid)
@@ -99,13 +135,11 @@ def aman_reward_fn(
             continue
 
         dman_slots = _parse_slots_json(dman_json)
-        atfm = json.loads(atfm_json) if atfm_json else {}
         profile = SupervisorProfileName(profile_str)
 
         # Merge AMAN + DMAN slots for full simulation
         merged = aman_action.arrival_slots + dman_slots
         outcome = simulate_plan(task, merged)
-        grades  = grade_task(task, outcome, merged, aman_action.rationale)
 
         # Per-role metrics (arrivals only)
         arrivals = [f for f in task.flights if f.operation == OperationType.ARRIVAL]
@@ -142,7 +176,11 @@ def aman_reward_fn(
         cross_penalty = 0.0
         if aman_runways & dman_runways:
             cross_outcome = simulate_plan(task, merged)
-            cross_penalty = 0.15 * cross_outcome.metrics.conflict_count
+            cross_penalty = _normalized_cross_conflict_penalty(
+                aman_action.arrival_slots,
+                dman_slots,
+                cross_outcome.metrics.conflict_count,
+            )
 
         # Theory-of-mind: did AMAN yield for DMAN emergencies without being forced?
         tom_bonus = _compute_tom_bonus_aman(aman_action, dman_slots, task)
@@ -158,7 +196,20 @@ def aman_reward_fn(
             + 0.05 * sup_align
             - cross_penalty
         )
-        rewards.append(round(max(-1.0, min(1.0, reward)), 4))
+        reward = round(max(-1.0, min(1.0, reward)), 4)
+        _debug_reward_trace(
+            role="AMAN",
+            components={
+                "delay_eff": delay_eff,
+                "emg_score": emg_score,
+                "coverage": coverage,
+                "tom_bonus": tom_bonus,
+                "sup_align": sup_align,
+                "cross_penalty": -cross_penalty,
+                "final_reward": reward,
+            },
+        )
+        rewards.append(reward)
 
     return rewards
 
@@ -238,7 +289,11 @@ def dman_reward_fn(
         aman_runways = {s.runway for s in aman_slots}
         if dman_runways & aman_runways:
             cross_outcome = simulate_plan(task, merged)
-            cross_penalty = 0.15 * cross_outcome.metrics.conflict_count
+            cross_penalty = _normalized_cross_conflict_penalty(
+                dman_action.departure_slots,
+                aman_slots,
+                cross_outcome.metrics.conflict_count,
+            )
 
         tom_bonus = _compute_tom_bonus_dman(dman_action, aman_slots, task)
         sup_align = _supervisor_alignment(outcome, task, profile)
@@ -252,7 +307,21 @@ def dman_reward_fn(
             + 0.05 * sup_align
             - cross_penalty
         )
-        rewards.append(round(max(-1.0, min(1.0, reward)), 4))
+        reward = round(max(-1.0, min(1.0, reward)), 4)
+        _debug_reward_trace(
+            role="DMAN",
+            components={
+                "delay_eff": delay_eff,
+                "atfm_score": atfm_score,
+                "emg_score": emg_score,
+                "coverage": coverage,
+                "tom_bonus": tom_bonus,
+                "sup_align": sup_align,
+                "cross_penalty": -cross_penalty,
+                "final_reward": reward,
+            },
+        )
+        rewards.append(reward)
 
     return rewards
 
@@ -359,7 +428,7 @@ def _compute_tom_bonus_aman(aman_action, dman_slots, task) -> float:
         flights_by_id[s.flight_id].priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
     ]
     if not emg_deps:
-        return 0.5  # no emergency = no need to yield, partial credit
+        return 0.0
     aman_runway_times = [(s.runway, s.assigned_minute) for s in aman_action.arrival_slots]
     for dep in emg_deps:
         # Check AMAN left ≥3 min gap around this dep slot on same runway
@@ -384,7 +453,7 @@ def _compute_tom_bonus_dman(dman_action, aman_slots, task) -> float:
         flights_by_id[s.flight_id].priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
     ]
     if not emg_arrs:
-        return 0.5
+        return 0.0
     dman_runway_times = [(s.runway, s.assigned_minute) for s in dman_action.departure_slots]
     for arr in emg_arrs:
         gap_ok = all(

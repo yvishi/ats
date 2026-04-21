@@ -44,15 +44,35 @@ if str(ROOT) not in sys.path:
 
 # ── Lazy imports (allow importing module without GPU) ─────────────────────────
 def _require_training_deps():
+    if sys.version_info >= (3, 14):
+        print(
+            "[ERROR] Python 3.14 is not currently supported by the GRPO stack "
+            "(trl/transformers/tokenizers/mergekit wheels)."
+        )
+        print("Use Python 3.11 or 3.12 for training runs.")
+        print("Recommended: run training on your remote A100 Jupyter environment.")
+        sys.exit(1)
+
     try:
         import torch
-        from unsloth import FastLanguageModel
         from trl import GRPOConfig, GRPOTrainer
-        return torch, FastLanguageModel, GRPOConfig, GRPOTrainer
     except ImportError as e:
         print(f"[ERROR] Training dependencies missing: {e}")
-        print("Install: pip install unsloth trl torch transformers")
+        print("Install core deps: pip install trl torch transformers")
+        print("If using this script as-is, also install: pip install unsloth")
+        print("Or with uv: uv sync --extra training --extra training-unsloth")
         sys.exit(1)
+
+    try:
+        from unsloth import FastLanguageModel
+    except ImportError:
+        print("[ERROR] 'unsloth' is not installed.")
+        print("This training script currently requires Unsloth for 4-bit QLoRA loading.")
+        print("Install: pip install unsloth")
+        print("Or with uv: uv sync --extra training --extra training-unsloth")
+        sys.exit(1)
+
+    return torch, FastLanguageModel, GRPOConfig, GRPOTrainer
 
 
 from training.dataset import (
@@ -103,6 +123,13 @@ REWARD_FN_DISPATCH = {
 }
 
 
+def _reward_failure_mode() -> str:
+    mode = os.getenv("REWARD_FAILURE_MODE", "strict").strip().lower()
+    if mode not in {"strict", "penalize"}:
+        return "strict"
+    return mode
+
+
 def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     """Unified reward dispatcher — routes to per-role reward function.
 
@@ -111,6 +138,7 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     """
     roles = kwargs.get("agent_role", [AgentRole.AMAN.value] * len(completions))
     rewards: List[float] = []
+    failure_mode = _reward_failure_mode()
 
     for i, (completion, role) in enumerate(zip(completions, roles)):
         fn = REWARD_FN_DISPATCH.get(role, aman_reward_fn)
@@ -118,10 +146,15 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
         sample_kwargs = {k: [v[i]] if isinstance(v, list) else [v] for k, v in kwargs.items()}
         try:
             r = fn([completion], **sample_kwargs)
-            rewards.append(r[0] if r else 0.0)
+            if not r:
+                raise RuntimeError(f"reward function returned empty list for role={role}")
+            rewards.append(r[0])
         except Exception as exc:
-            print(f"[WARN] reward_fn({role}) failed: {exc}")
-            rewards.append(0.0)
+            message = f"reward_fn({role}) failed at sample_index={i}: {exc}"
+            if failure_mode == "strict":
+                raise RuntimeError(message) from exc
+            print(f"[WARN] {message}")
+            rewards.append(-1.0)
 
     return rewards
 
@@ -138,7 +171,6 @@ def train(
     hub_model_id:  Optional[str] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
-    import wandb
 
     print(f"\n{'='*60}")
     print(f"  ATC Multi-Agent GRPO Training")
