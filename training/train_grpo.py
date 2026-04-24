@@ -1,26 +1,17 @@
-"""Multi-Agent ATC Training with DAPO/GRPO + Unsloth.
+"""Multi-Agent ATC Training with GRPO + Unsloth.
 
 Architecture overview:
   - Single LLM (Qwen2.5-7B-Instruct, 4-bit LoRA) plays 4 roles via system prompts
-  - DAPO (Dynamic Asymmetric Policy Optimization, ByteDance 2025) when supported by
-    the installed TRL version; falls back gracefully to vanilla GRPO otherwise.
-    DAPO fixes entropy collapse via asymmetric clipping and zero-variance group
-    filtering — typically 15–25% more stable training vs vanilla GRPO.
+  - GRPO (Group Relative Policy Optimization): group-relative advantage estimation
+    without a value network — memory-efficient and stable for multi-agent settings.
   - Group-relative advantage: A_i = (r_i - mean(r_group)) / (std(r_group) + ε)
   - Four independent reward functions (AMAN, DMAN, GENERATOR, SUPERVISOR)
   - Potential-based reward shaping within each role (policy-gradient safe)
   - Adaptive curriculum: generator escalates difficulty as agents improve
 
-DAPO vs GRPO key differences (when TRL supports loss_type="dapo"):
-  - Asymmetric clipping: epsilon_low=0.2, epsilon_high=0.28 (harder clip on
-    negative advantages prevents large policy regression from bad rollouts)
-  - filter_groups=True: drops groups where all rollouts have equal reward
-    (zero-variance groups give no training signal and waste compute)
-  - Lower KL coefficient: more exploration room for multi-agent coordination
-
 Training loop:
   Episode → Generator mutates task → AMAN bids → DMAN bids →
-  Negotiate (if conflicts) → Grade → Per-agent DAPO/GRPO update
+  Negotiate (if conflicts) → Grade → Per-agent GRPO update
 
 Colab T4 resource profile:
   Model:        Qwen2.5-7B-Instruct, 4-bit QLoRA
@@ -119,12 +110,8 @@ N_GENERATIONS  = 2    # safer default for modern GRPOTrainer on Colab GPUs
 BATCH_SIZE     = 2
 GRAD_ACCUM     = 4
 LR             = 5e-5
-KL_COEFF       = 0.01  # KL penalty — lowered for DAPO (more exploration room)
+KL_COEFF       = 0.04
 WARMUP_RATIO   = 0.05
-
-# DAPO-specific (used only when the installed TRL version supports them)
-DAPO_EPSILON_HIGH  = 0.28   # asymmetric upper clip (vs standard 0.2 lower clip)
-DAPO_FILTER_GROUPS = True   # drop zero-variance groups (no training signal)
 
 
 # ── Role-dispatch reward table ────────────────────────────────────────────────
@@ -319,19 +306,7 @@ def train(
     if _config_supports("use_vllm", GRPOConfig):
         grpo_kwargs["use_vllm"] = False
 
-    # ── DAPO upgrade (graceful fallback to vanilla GRPO if TRL is older) ──────
-    # DAPO (ByteDance 2025): asymmetric clipping + zero-variance group filtering
-    # prevents entropy collapse that vanilla GRPO suffers in multi-agent settings.
-    _dapo_active = False
-    if _config_supports("loss_type", GRPOConfig):
-        grpo_kwargs["loss_type"] = "dapo"
-        _dapo_active = True
-    if _config_supports("epsilon_high", GRPOConfig):
-        grpo_kwargs["epsilon_high"] = DAPO_EPSILON_HIGH
-    if _config_supports("filter_groups", GRPOConfig):
-        grpo_kwargs["filter_groups"] = DAPO_FILTER_GROUPS
-
-    print(f"    Loss type: {'DAPO (asymmetric clip + group filter)' if _dapo_active else 'GRPO (vanilla — upgrade TRL for DAPO)'}")
+    print("    Loss type: GRPO")
 
     grpo_config = GRPOConfig(**grpo_kwargs)
 
