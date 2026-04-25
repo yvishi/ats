@@ -11,12 +11,15 @@ tags:
   - rlve
   - cooperative-competitive
   - self-play
+  - domain-transfer
+  - adapt
 ---
 
 ![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-blue)
 ![Tasks](https://img.shields.io/badge/tasks-4-green)
 ![Modes](https://img.shields.io/badge/modes-single%20%2B%20multi--agent-orange)
 ![Training](https://img.shields.io/badge/training-GRPO%20%2B%20Unsloth-purple)
+![ADAPT](https://img.shields.io/badge/ADAPT-domain%20transfer-red)
 ![HF Space](https://img.shields.io/badge/HF%20Space-live-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -47,14 +50,15 @@ We built this coordination problem as a live RL environment — and trained two 
 | Item | Detail |
 |---|---|
 | Domain | Real ATC disruption recovery across four Indian airports |
-| Agents | AMAN, DMAN, adversarial Generator, rotating Supervisor |
+| Agents | AMAN, DMAN, adversarial Generator, rotating Supervisor, **ADAPT meta-agent** |
 | Protocol | BID → NEGOTIATE → FINAL (3-round partial observability) |
 | Tasks | 4 deterministic scenarios spanning easy to hard |
 | Grading | 3-layer gated composite score, strict `(0, 1)` output |
 | Curriculum | EMA-adaptive Generator: 6 difficulty levels |
 | Training | GRPO · N=4 groups · Unsloth 4-bit QLoRA · Colab T4 compatible |
 | OpenEnv | Full compliance: `ATCAction`, `ATCObservation`, `ATCState` |
-| Key differentiator | Verifiable rewards — no LLM judge needed for correctness |
+| Key differentiator | **ADAPT** — structural domain transfer, zero prior knowledge required |
+| Transfer demo | ICU surge management solved by AMAN+DMAN with no code changes |
 | Space | https://huggingface.co/spaces/GTsingh12/ATS-openenv |
 
 ---
@@ -149,10 +153,112 @@ graph TD
         RD["dman_reward_fn"]
         RG["generator_reward_fn"]
         RS["supervisor_reward_fn"]
+        RADAPT["adapt_reward_fn"]
     end
+
+    subgraph ADAPT_LAYER["🧠 ADAPT Meta-Agent"]
+        ADP["Structural Profiler\ntime_pressure · connection_risk\nfuel_burn · passengers · notes"]
+        ADP -->|"entity_wake_map\nentity_priority_map"| MA
+    end
+
+    DOMAIN["🌐 Unknown Domain Task\n(any scheduling problem)"] --> ADP
 ```
 
 *AMAN and DMAN cannot read each other's observations. Information crosses the boundary only through the message channel.*
+
+*ADAPT sits one level above — it never touches a runway or assigns a slot. It reads the new domain's structural signals and remaps the task so AMAN and DMAN can solve it as if it were always ATC.*
+
+---
+
+## ADAPT — When the System Outgrows Its Domain
+
+Here is the thing about building a genuinely good scheduler: if you train it hard enough on the right abstractions, it stops being an air traffic controller. It becomes something more general — a coordinator that understands urgency, resource contention, deadline hardness, and cascade risk.
+
+We wanted to test that idea. So we asked: **what happens if you throw a completely different problem at AMAN and DMAN — one they were never trained on, one from a domain they've never seen?**
+
+The answer is ADAPT.
+
+### The Idea
+
+ADAPT is a meta-agent. It sits one layer above the coordinators. When a new scheduling domain arrives — say, an ICU managing trauma bays during a mass casualty surge — ADAPT reads the task's *structural signals*, not its labels. It doesn't know what "TRAUMA" means. It doesn't need to.
+
+What it *does* know is this:
+
+- An entity with a **7-minute average time window** and a **0.93 connection risk** is something that cannot wait.
+- An entity with a **150-minute window** and **zero cascade risk** can be scheduled whenever the coordinators have capacity.
+- The numbers tell the story. The domain label is irrelevant.
+
+So ADAPT computes a structural profile for each entity type — time pressure, connection risk, resource intensity, urgency signals in notes — and maps them onto ATC parameters:
+
+```
+entity_wake_map:     { TRAUMA → H,  CARDIAC → M,  ROUTINE → L }
+entity_priority_map: { TRAUMA → emergency,  CARDIAC → medical,  ROUTINE → normal }
+```
+
+Once that mapping is produced, the task looks like any other ATC episode to AMAN and DMAN. They schedule it. They negotiate over the shared beds — now called "runways". They handle the emergency first. They minimize delay. **No code changes. No retraining. No domain-specific rules.**
+
+### The Formula
+
+The structural inference is fully transparent and deterministic:
+
+| Signal | Weight | Description |
+|---|---:|---|
+| `time_pressure` | 0.50 | `1 − avg_window / planning_horizon` — how tight is the scheduling window? |
+| `connection_risk` | 0.40 | Probability of cascading failure if this entity is delayed |
+| `urgency_in_notes` | 0.10 | Free-text urgency signal — domain-agnostic English markers |
+
+```
+combined_score = 0.5 × time_pressure + 0.4 × connection_risk + 0.1 × urgency_flag
+
+≥ 0.70  →  wake_class = "H"   (maximum separation, like a jumbo jet)
+≥ 0.35  →  wake_class = "M"   (standard separation)
+< 0.35  →  wake_class = "L"   (minimum separation, like a light aircraft)
+```
+
+Priority follows a parallel threshold on connection risk and time pressure. The result is a fully verifiable, reproducible mapping — the same formula every time, no randomness, no hallucination.
+
+### The Demo: ICU Surge Management
+
+We built three ICU scenarios to demonstrate the transfer:
+
+| Scenario | Description | Key Challenge |
+|---|---|---|
+| `icu_normal_day` | Mixed routine, cardiac, and post-op patients | Bed allocation under light contention |
+| `icu_flu_surge` | 3× cardiac admissions, no warning | Priority inversion — elective patients must yield |
+| `icu_mass_casualty` | Multi-vehicle collision, 3 trauma teams | Maximum urgency, near-zero slack, cascade risk |
+
+Trauma patients arrive with 7-minute windows and 0.93 connection risk. ADAPT infers: `H / emergency`. Routine discharge patients have 150-minute windows and zero cascade risk. ADAPT infers: `L / normal`. No one told ADAPT what a trauma patient was. It read the numbers.
+
+The downstream reward is measured by running AMAN and DMAN on the mapped task and comparing the composite score to a baseline of running them on the *unmapped* task. The improvement is ADAPT's reward signal.
+
+### Why This Matters
+
+Most RL environments are domain-locked. You train a model on Go, it plays Go. You train it on ATC, it schedules runways.
+
+We went a step further. Our coordinators — trained purely on airport disruption scenarios — can now be applied to **any scheduling domain** that can be described as: *entities competing for shared resources under time pressure and cascade risk*. Hospital beds. Container berths. Factory assembly lanes. Power grid maintenance windows.
+
+ADAPT is the bridge. And it requires no retraining of AMAN or DMAN to cross it.
+
+```
+New domain task
+       │
+       ▼
+  ADAPT reads structural signals
+  (no domain labels, pure numbers)
+       │
+       ▼
+  entity_wake_map + entity_priority_map
+       │
+       ▼
+  Task remapped as ATC episode
+       │
+       ├──▶  AMAN schedules "arrivals" (admissions, inbound cargo, inbound ships…)
+       └──▶  DMAN schedules "departures" (discharges, outbound cargo, outbound ships…)
+                    │
+                    ▼
+             Same reward, same grader, same safety gates
+             (conflict-free, emergency-first, deadline-compliant)
+```
 
 ---
 
@@ -340,20 +446,23 @@ From `constants.py`:
 | `constants.py` | Shared scoring, separation, and multi-agent constants |
 | `client.py` | OpenEnv client wrapper |
 | `inference.py` | Single-agent baseline runner |
-| `multi_agent/models.py` | AMAN/DMAN/generator/supervisor contracts |
+| `multi_agent/models.py` | AMAN/DMAN/generator/supervisor/ADAPT contracts |
 | `multi_agent/environment.py` | Multi-agent environment and per-role rewards |
 | `multi_agent/generator.py` | EMA-adaptive adversarial curriculum, 6 difficulty levels |
 | `multi_agent/supervisor.py` | Rotating supervisor preference profiles |
+| `multi_agent/adapt.py` | **ADAPT meta-agent** — structural profiler, mapping engine, domain-agnostic inference |
 | `multi_agent/inference.py` | Multi-agent heuristic/LLM episode runner |
-| `training/dataset.py` | GRPO dataset builder and output parsers |
-| `training/reward_functions.py` | Role-specific GRPO reward functions with COMA credit |
+| `domains/__init__.py` | Domain registry — add new transfer domains here |
+| `domains/icu.py` | ICU surge management — ADAPT demo domain (3 scenarios) |
+| `training/dataset.py` | GRPO dataset builder, ADAPT sample generator, output parsers |
+| `training/reward_functions.py` | Role-specific GRPO reward functions with COMA credit + `adapt_reward_fn` |
 | `training/train_grpo.py` | Multi-agent GRPO training entry point |
 | `training/eval.py` | Before/after training evaluation |
 | `server/app.py` | FastAPI/OpenEnv app + UI + multi-agent endpoints |
 | `server/atc_environment.py` | Single-agent OpenEnv environment |
 | `openenv.yaml` | OpenEnv metadata including multi-agent declarations |
 | `scripts/run_graders.py` | Deterministic grader smoke check |
-| `tests/` | Automated tests across single-agent and multi-agent paths |
+| `tests/` | Automated tests across single-agent, multi-agent, and ADAPT transfer paths |
 
 ---
 
@@ -512,3 +621,5 @@ python scripts/deploy_hf_space.py --space-id "$HF_SPACE_ID" --repo-dir .
 - **GRPO over PPO** — no value network required. Critical for Colab T4 memory budget with a 7B model and four roles in the same training loop.
 - **Single model, multiple roles** — AMAN and DMAN are system-prompt-differentiated instances of the same weights. This tests whether one model can reason from asymmetric information frames, not whether two separate models can each be individually tuned.
 - **Partial observability is structural** — AMAN receives `atfm_deadlines={}`. DMAN receives the real deadline map. Neither can cheat. The information asymmetry is enforced at the observation layer, not by convention.
+- **ADAPT uses no domain knowledge** — the structural profiler reads only numbers (`time_pressure`, `connection_risk`, `fuel_burn`, `passengers`). Entity type names are never used in the inference formula. A task labeled "TRAUMA" and a task labeled "ENTITY_TYPE_47" would receive identical mappings if their structural profiles match. This is intentional: the goal is transfer, not memorization.
+- **Adding a new transfer domain is three steps** — create a `TaskDefinition` with entity types in `FlightRecord.airline`, register the module in `domains/__init__.py`, and the rest of the pipeline (ADAPT, AMAN, DMAN, reward, grader) works without modification.
