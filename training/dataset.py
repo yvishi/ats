@@ -23,13 +23,12 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import OperationType, SlotAssignment
+from models import OperationType, SlotAssignment, TaskDefinition
 from tasks import task_catalog, ordered_tasks
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
     AMANAction,
-    ADAPTAction,
     DMANAction,
     GeneratorAction,
     GeneratorMutation,
@@ -39,14 +38,9 @@ from multi_agent.models import (
     AgentRole,
     SupervisorProfileName,
     SUPERVISOR_PROFILES,
+    ADAPTObservation,
 )
 from multi_agent.supervisor import SupervisorAgent
-from multi_agent.adapt import (
-    apply_adapt_mapping,
-    build_adapt_observation,
-    _build_adapt_heuristic,
-    parse_adapt_action,
-)
 
 
 # ── System prompts ────────────────────────────────────────────────────────────
@@ -165,84 +159,6 @@ OUTPUT FORMAT (strict JSON, no markdown):
 }"""
 
 
-ADAPT_SYSTEM = """You are ADAPT (Adaptive Decision Agent for Problem Transfer).
-
-You receive scheduling problems from UNKNOWN domains. You have NO prior knowledge
-of what the domain is. Your task is to analyse the structural properties of the
-entities — as shown in the Entity Type Structural Profiles — and map them to
-Air Traffic Control parameters so that the existing AMAN and DMAN coordination
-agents can solve the problem without any code changes.
-
-ATC PARAMETER REFERENCE:
-  wake_class:  "H" = highest resource demand / tightest separation required
-               "M" = moderate demand / standard separation
-               "L" = lowest demand / minimum separation needed
-  priority:    "emergency"  = handle FIRST, zero delay tolerance
-               "medical"    = high urgency, ≤5 min delay maximum
-               "connection" = hard external deadline that must be met
-               "normal"     = standard flexible scheduling
-
-STRUCTURAL REASONING GUIDE:
-Read the numerical profiles. Do NOT reason from entity type names.
-
-  time_pressure (0.0 → 1.0):
-    > 0.85  → very tight window → strong urgency signal
-    0.60–0.85 → moderate urgency
-    < 0.60  → flexible, low urgency
-
-  connection_risk (0.0 → 1.0):
-    > 0.80  → emergency-level cascade risk if delayed
-    0.50–0.80 → medical-level risk
-    0.20–0.50 → connection deadline risk
-    < 0.20  → normal, deferrable
-
-  resource use (intensity/min × units):
-    High values → entity needs more separation (Heavy equivalent)
-    Low values  → entity needs less separation (Light equivalent)
-
-  urgency_in_notes: YES = direct operator urgency signal → increase tier by 1.
-
-COMBINED SCORE FORMULA:
-  combined = 0.5 × time_pressure + 0.4 × connection_risk + 0.1 × urgency_flag
-  ≥ 0.70 → "H" | 0.35–0.70 → "M" | < 0.35 → "L"
-
-PRIORITY FORMULA:
-  connection_risk ≥ 0.80 OR (time_pressure ≥ 0.95 AND urgency) → "emergency"
-  connection_risk ≥ 0.50 OR time_pressure ≥ 0.80               → "medical"
-  connection_risk ≥ 0.20 OR time_pressure ≥ 0.60               → "connection"
-  else                                                           → "normal"
-
-CRITICAL — PRIORITY DISTRIBUTION CONSTRAINT:
-AMAN and DMAN are designed for a realistic priority distribution where emergencies
-are RARE. Mapping too many entity types to "emergency" causes resource starvation:
-AMAN yields all capacity to emergencies, DMAN gets nothing, and the joint score collapses.
-
-Enforce these hard budgets (N = number of distinct entity types):
-  - "emergency": EXACTLY 1 entity type maximum, regardless of N.
-  - "H" wake:    at most floor(N / 3) entity types, minimum 1.
-  - "medical":   at most ceil(N / 3) entity types (after emergency slot is taken).
-  - Everything else cascades to "connection" or "normal".
-
-If multiple entity types score ≥ 0.80 connection_risk, assign "emergency" only to the
-SINGLE highest scorer. Demote the rest to "medical". Cite this explicitly in rationale.
-
-OUTPUT FORMAT (strict JSON, no markdown):
-{
-  "entity_wake_map": {
-    "ENTITY_A": "H",
-    "ENTITY_B": "M",
-    "ENTITY_C": "L"
-  },
-  "entity_priority_map": {
-    "ENTITY_A": "emergency",
-    "ENTITY_B": "medical",
-    "ENTITY_C": "normal"
-  },
-  "rationale": "per entity: 'ENTITY_A: tp=0.97 cr=0.93 score=0.86 → H/emergency (budget slot 1/1)'"
-}"""
-
-
-
 SUPERVISOR_SYSTEM_TEMPLATE = """You are an ATC Supervisor evaluating a completed runway plan.
 Your preference this shift: {preference}
 
@@ -255,6 +171,29 @@ OUTPUT FORMAT (strict JSON, no markdown):
   "alignment": "explain how well the plan matches your stated preference",
   "key_violations": ["list specific violations of your preference"]
 }}"""
+
+
+ADAPT_SYSTEM = """You are ADAPT (STRUCTURAL Domain Meta-Agent).
+You are given a scheduling task from an UNKNOWN domain (e.g. Hospital ICU, Port Logistics).
+You do NOT know the domain's terminology. You must ignore labels like "TRAUMA" or "BERTH" and focus on:
+1. time_pressure: How narrow is the execution window?
+2. connection_risk: Is this entity part of a sequence (risk of cascade)?
+3. Resource Intensity: How much runway/resource time does it need?
+
+Your job: Map these abstract entities into ATC-specific parameters (Wake Class and Priority)
+so that the existing AMAN/DMAN models can solve the task with zero retraining.
+
+MAPPING GUIDE:
+- Wake Class (H, M, L): Structural separation. Map high-intensity/high-risk to 'H', low to 'L'.
+- Priority (emergency, medical, connection, normal): Sequence urgency. Map highest time pressure to 'emergency'.
+
+OUTPUT FORMAT (strict JSON, no markdown):
+{
+  "entity_wake_map": {"ENTITY_TYPE_A": "H|M|L", "ENTITY_TYPE_B": "..."},
+  "entity_priority_map": {"ENTITY_TYPE_A": "emergency|medical|connection|normal", ...},
+  "rationale": "Explain using NUMERICAL structural signals (time pressure, risk) why you chose these mappings."
+}"""
+
 
 
 # ── Dataset builder ───────────────────────────────────────────────────────────
@@ -273,9 +212,6 @@ def build_episode_dataset(
     Each episode has: 1 AMAN bid + 1 DMAN bid + optionally 1 negotiation round.
     If include_generator: also 1 generator turn per episode.
     If include_supervisor: also 1 supervisor turn per episode.
-    If include_adapt: ~30% of episodes are domain-transfer episodes (ICU tasks).
-      Each domain episode emits: 1 ADAPT sample + 1 AMAN sample + 1 DMAN sample
-      on the ADAPT-mapped task (so AMAN/DMAN see correctly-parameterised flights).
     """
     import random
     rng = random.Random(seed)
@@ -285,79 +221,25 @@ def build_episode_dataset(
     env = MultiAgentATCEnvironment(seed=seed)
     generator = ChallengeGenerator(seed=seed)
 
-    # Lazy-import ICU domain to avoid circular dependencies
-    domain_tasks: List = []
-    domain_name: str = ""
-    domain_description: str = ""
-    if include_adapt:
-        from domains.icu import icu_task_catalog, ICU_DOMAIN_DESCRIPTION
-        icu_catalog = icu_task_catalog()
-        domain_tasks = list(icu_catalog.values())
-        domain_name = "Hospital ICU Surge Management"
-        domain_description = ICU_DOMAIN_DESCRIPTION
-
     samples: List[Dict[str, Any]] = []
 
     for ep_id in range(n_episodes):
-        # ~30% of episodes are domain-transfer (ADAPT) episodes
-        is_domain_ep = (
-            include_adapt
-            and bool(domain_tasks)
-            and rng.random() < domain_episode_ratio
-        )
+        # ── ADAPT Domain Sample (Stochastic) ──────────────────────────────────
+        if include_adapt and rng.random() < domain_episode_ratio:
+            from domains import get_all_domain_tasks
+            from multi_agent.adapt import build_adapt_observation
+            domain_tasks = get_all_domain_tasks()
+            if domain_tasks:
+                tid = rng.choice(list(domain_tasks.keys()))
+                dtask = domain_tasks[tid]
+                profile = supervisor.sample_profile(ep_id)
+                obs = build_adapt_observation(dtask, profile)
+                samples.append(_make_adapt_sample(ep_id, obs, dtask))
+                continue
 
-        if is_domain_ep:
-            domain_task = rng.choice(domain_tasks)
-            profile = supervisor.sample_profile(ep_id)
-
-            # Build ADAPT observation and heuristic action
-            adapt_obs = build_adapt_observation(
-                task=domain_task,
-                profile=profile,
-                domain_name=domain_name,
-                domain_description=domain_description,
-            )
-            adapt_action = _build_adapt_heuristic(adapt_obs, domain_task)
-
-            # Emit ADAPT training sample
-            samples.append(_make_adapt_sample(
-                ep_id=ep_id,
-                obs=adapt_obs,
-                domain_task=domain_task,
-            ))
-
-            # Apply ADAPT mapping so AMAN/DMAN see a properly parameterised task
-            mapped_task = apply_adapt_mapping(domain_task, adapt_action)
-
-            aman_obs, dman_obs = env.reset(
-                episode_id=ep_id,
-                supervisor_profile=profile,
-                mutated_task=mapped_task,
-            )
-            atfm_json = json.dumps(env._state.atfm_deadlines)
-            sup_desc = SUPERVISOR_PROFILES[profile]["description"]
-
-            samples.append(_make_aman_sample(
-                ep_id=ep_id,
-                obs=aman_obs,
-                atfm_json=atfm_json,
-                dman_slots_json="[]",
-                sup_desc=sup_desc,
-                profile=profile,
-                round_name="bid",
-            ))
-            samples.append(_make_dman_sample(
-                ep_id=ep_id,
-                obs=dman_obs,
-                atfm_json=atfm_json,
-                aman_slots_json="[]",
-                sup_desc=sup_desc,
-                profile=profile,
-                round_name="bid",
-            ))
-            continue
 
         base_task = rng.choice(task_list)
+
         profile = supervisor.sample_profile(ep_id)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
@@ -503,33 +385,13 @@ def _make_generator_sample(
     }
 
 
-def _make_adapt_sample(
-    ep_id: int,
-    obs,
-    domain_task,
-) -> Dict[str, Any]:
-    system = ADAPT_SYSTEM
-    user = obs.to_prompt_text()
-    return {
-        "prompt": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        "task_id":            obs.domain_id,
-        "agent_role":         AgentRole.ADAPT.value,
-        "episode_id":         ep_id,
-        "round":              "adapt",
-        "supervisor_profile": obs.supervisor_profile_name.value,
-        "domain_task_json":   domain_task.model_dump_json(),
-    }
-
-
 def _make_supervisor_sample(
     ep_id: int,
     task,
     profile: SupervisorProfileName,
     sup_desc: str,
 ) -> Dict[str, Any]:
+    merged_plan_json = _build_reference_merged_plan_json(task)
     system = SUPERVISOR_SYSTEM_TEMPLATE.format(preference=sup_desc)
     user_content = (
         f"Task: {task.task_id}\nAirport: {task.airport}\n"
@@ -546,8 +408,30 @@ def _make_supervisor_sample(
         "episode_id":         ep_id,
         "round":              "evaluate",
         "supervisor_profile": profile.value,
-        "merged_plan_json":   "[]",
+        "merged_plan_json":   merged_plan_json,
     }
+
+
+def _build_reference_merged_plan_json(task) -> str:
+    """Build a deterministic full-plan baseline for supervisor training."""
+    slots: List[Dict[str, Any]] = []
+    for flight in task.flights:
+        if not flight.allowed_runways:
+            continue
+        assigned_minute = max(
+            int(flight.earliest_minute),
+            min(int(flight.latest_minute), int(flight.scheduled_minute)),
+        )
+        hold_minutes = max(0, abs(assigned_minute - int(flight.scheduled_minute)))
+        slots.append(
+            {
+                "flight_id": str(flight.flight_id),
+                "runway": str(flight.allowed_runways[0]),
+                "assigned_minute": int(assigned_minute),
+                "hold_minutes": int(hold_minutes),
+            }
+        )
+    return json.dumps(slots)
 
 
 # ── Action parsers (completion → typed action) ────────────────────────────────
@@ -575,37 +459,122 @@ def _coerce_completion_text(completion: Any) -> str:
 
 
 def _extract_json(text: Any) -> Optional[str]:
-    """Extract first JSON object from an LLM completion."""
+    """Extract first JSON object from an LLM completion.
+
+    Handles the most common LLM output quirks:
+      - markdown fences (```json, ```JSON, ```)
+      - Python literals: True/False/None → true/false/null
+      - single-quote dicts  → double-quote JSON (ast fallback)
+    """
     text = _coerce_completion_text(text)
-    text = re.sub(r"```(?:json)?", "", text).strip()
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    return match.group(0) if match else None
+    # Strip all markdown code fences regardless of language tag or case
+    text = re.sub(r"```[a-zA-Z]*\s*", "", text)
+    text = re.sub(r"```", "", text).strip()
+
+    candidates = _extract_balanced_json_candidates(text)
+    for raw in candidates:
+        # Normalise Python literals so json.loads can parse them
+        # Use word-boundary replacements to avoid mangling string values
+        norm = re.sub(r"\bTrue\b", "true", raw)
+        norm = re.sub(r"\bFalse\b", "false", norm)
+        norm = re.sub(r"\bNone\b", "null", norm)
+        if _loads_lenient(norm) is not None:
+            return norm
+    return None
+
+
+def _extract_balanced_json_candidates(text: str) -> List[str]:
+    """Extract balanced {...} object candidates from a completion."""
+    candidates: List[str] = []
+    start = None
+    depth = 0
+    in_string = False
+    escape = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidates.append(text[start : idx + 1])
+                    start = None
+    if not candidates:
+        # Fallback keeps previous behavior when braces are malformed.
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            candidates.append(match.group(0))
+    return candidates
+
+
+def _loads_lenient(raw: str) -> Optional[dict]:
+    """json.loads with ast.literal_eval fallback for single-quote dicts."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            import ast
+            obj = ast.literal_eval(raw)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+
+def _safe_slot(s: dict, op: str) -> Optional[SlotAssignment]:
+    """Build a SlotAssignment tolerating wrong field types from LLM output."""
+    try:
+        return SlotAssignment(
+            flight_id=str(s.get("flight_id", "")),
+            runway=str(s.get("runway", "")),
+            assigned_minute=int(float(s.get("assigned_minute", 0))),
+            hold_minutes=int(float(s.get("hold_minutes", 0))),
+        )
+    except Exception:
+        return None
 
 
 def parse_aman_action(completion: Any) -> Optional[AMANAction]:
     raw = _extract_json(completion)
     if not raw:
         return None
+    data = _loads_lenient(raw)
+    if not isinstance(data, dict):
+        return None
     try:
-        data = json.loads(raw)
-        slots = [SlotAssignment(**s) for s in data.get("arrival_slots", [])]
-        msgs  = [
-            NegotiationMessage(
-                from_role=AgentRole.AMAN,
-                message_type=MessageType(m.get("message_type", "runway_claim")),
-                flight_id=m.get("flight_id", ""),
-                requested_minute=int(m.get("requested_minute", 0)),
-                runway_id=m.get("runway_id", ""),
-                priority=m.get("priority", "normal"),
-                reason=m.get("reason", ""),
-                is_emergency=bool(m.get("is_emergency", False)),
-            )
-            for m in data.get("outgoing_messages", [])
-        ]
+        # Per-slot try/except: one bad slot skips that slot, not the whole action
+        slots = [s for s in (_safe_slot(x, "arrival") for x in data.get("arrival_slots", [])) if s]
+        msgs = []
+        for m in data.get("outgoing_messages", []):
+            try:
+                msgs.append(NegotiationMessage(
+                    from_role=AgentRole.AMAN,
+                    message_type=MessageType(m.get("message_type", "runway_claim")),
+                    flight_id=str(m.get("flight_id", "")),
+                    requested_minute=int(float(m.get("requested_minute", 0))),
+                    runway_id=str(m.get("runway_id", "")),
+                    priority=str(m.get("priority", "normal")),
+                    reason=str(m.get("reason", "")),
+                    is_emergency=bool(m.get("is_emergency", False)),
+                ))
+            except Exception:
+                continue
         return AMANAction(
             arrival_slots=slots,
-            rationale=data.get("rationale", ""),
-            emergency_yields=data.get("emergency_yields", []),
+            rationale=str(data.get("rationale", "")),
+            emergency_yields=list(data.get("emergency_yields", [])),
             outgoing_messages=msgs,
             commit=bool(data.get("commit", False)),
         )
@@ -617,27 +586,31 @@ def parse_dman_action(completion: Any) -> Optional[DMANAction]:
     raw = _extract_json(completion)
     if not raw:
         return None
+    data = _loads_lenient(raw)
+    if not isinstance(data, dict):
+        return None
     try:
-        data = json.loads(raw)
-        slots = [SlotAssignment(**s) for s in data.get("departure_slots", [])]
-        msgs  = [
-            NegotiationMessage(
-                from_role=AgentRole.DMAN,
-                message_type=MessageType(m.get("message_type", "runway_claim")),
-                flight_id=m.get("flight_id", ""),
-                requested_minute=int(m.get("requested_minute", 0)),
-                runway_id=m.get("runway_id", ""),
-                priority=m.get("priority", "normal"),
-                reason=m.get("reason", ""),
-                is_emergency=bool(m.get("is_emergency", False)),
-            )
-            for m in data.get("outgoing_messages", [])
-        ]
+        slots = [s for s in (_safe_slot(x, "departure") for x in data.get("departure_slots", [])) if s]
+        msgs = []
+        for m in data.get("outgoing_messages", []):
+            try:
+                msgs.append(NegotiationMessage(
+                    from_role=AgentRole.DMAN,
+                    message_type=MessageType(m.get("message_type", "runway_claim")),
+                    flight_id=str(m.get("flight_id", "")),
+                    requested_minute=int(float(m.get("requested_minute", 0))),
+                    runway_id=str(m.get("runway_id", "")),
+                    priority=str(m.get("priority", "normal")),
+                    reason=str(m.get("reason", "")),
+                    is_emergency=bool(m.get("is_emergency", False)),
+                ))
+            except Exception:
+                continue
         return DMANAction(
             departure_slots=slots,
-            rationale=data.get("rationale", ""),
-            atfm_compliance=data.get("atfm_compliance", {}),
-            emergency_broadcasts=data.get("emergency_broadcasts", []),
+            rationale=str(data.get("rationale", "")),
+            atfm_compliance=dict(data.get("atfm_compliance", {})),
+            emergency_broadcasts=list(data.get("emergency_broadcasts", [])),
             outgoing_messages=msgs,
             commit=bool(data.get("commit", False)),
         )
@@ -669,3 +642,20 @@ def parse_generator_action(completion: Any) -> Optional[GeneratorAction]:
         )
     except Exception:
         return None
+
+
+def _make_adapt_sample(ep_id: int, obs: ADAPTObservation, domain_task: TaskDefinition) -> Dict[str, Any]:
+    return {
+        "prompt": [
+            {"role": "system", "content": ADAPT_SYSTEM},
+            {"role": "user",   "content": obs.to_prompt_text()},
+        ],
+        "task_id": "domain_transfer",
+        "agent_role": AgentRole.ADAPT.value,
+        "round": "adapt",
+        "domain_task_json": domain_task.model_dump_json(),
+        "supervisor_profile": obs.supervisor_profile_name.value,
+    }
+
+
+

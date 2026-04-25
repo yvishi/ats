@@ -31,14 +31,6 @@ try:
     from ..multi_agent.generator import ChallengeGenerator
     from ..multi_agent.models import SupervisorProfileName
     from ..multi_agent.supervisor import SupervisorAgent
-    from ..multi_agent.adapt import (
-        apply_adapt_mapping,
-        _build_adapt_heuristic,
-        build_adapt_observation,
-        parse_adapt_action,
-    )
-    from ..multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
-    from ..multi_agent.environment import MultiAgentATCEnvironment
 except ImportError:
     import sys
 
@@ -55,20 +47,18 @@ except ImportError:
     from multi_agent.generator import ChallengeGenerator
     from multi_agent.models import SupervisorProfileName
     from multi_agent.supervisor import SupervisorAgent
-    from multi_agent.adapt import (
-        apply_adapt_mapping,
-        _build_adapt_heuristic,
-        build_adapt_observation,
-        parse_adapt_action,
-    )
-    from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
-    from multi_agent.environment import MultiAgentATCEnvironment
 
 _CATALOG = None
 _SUPERVISOR = SupervisorAgent()
 _GENERATOR = ChallengeGenerator()
 _TRACE_REWARDS = os.getenv("ATC_REWARD_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 _DEFAULT_SUPERVISOR_PROFILE = SupervisorProfileName.SAFETY_STRICT
+_ROLE_TOKEN_BUDGETS = {
+    "AMAN": int(os.getenv("ATC_ROLE_TOKENS_AMAN", "384")),
+    "DMAN": int(os.getenv("ATC_ROLE_TOKENS_DMAN", "384")),
+    "GENERATOR": int(os.getenv("ATC_ROLE_TOKENS_GENERATOR", "224")),
+    "SUPERVISOR": int(os.getenv("ATC_ROLE_TOKENS_SUPERVISOR", "160")),
+}
 
 
 def _debug_reward_trace(role: str, components: Dict[str, float]) -> None:
@@ -110,6 +100,48 @@ def _safe_float(value: Any, default: float = 0.5) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _weighted_active_mean(parts: List[tuple[float, float, bool]]) -> float:
+    num = 0.0
+    den = 0.0
+    for value, weight, active in parts:
+        if not active:
+            continue
+        num += float(value) * float(weight)
+        den += float(weight)
+    return num / den if den > 1e-9 else 0.0
+
+
+def _approx_token_count(text: str) -> int:
+    # Simple, fast approximation suitable for relative penalties.
+    return max(0, len(text.split()))
+
+
+def _length_budget_penalty(role: str, completion: Any) -> float:
+    text = _coerce_completion_text(completion)
+    budget = max(32, _ROLE_TOKEN_BUDGETS.get(role, 256))
+    n = _approx_token_count(text)
+    if n <= budget:
+        return 0.0
+    overflow = n - budget
+    return min(0.25, overflow / max(1.0, float(budget)) * 0.25)
+
+
+def _controller_failure_reward(completion: Any, role: str) -> float:
+    """Spread parse-failure rewards to avoid flat-floor collapse in GRPO."""
+    text = _coerce_completion_text(completion)
+    base_credit = _parse_partial_credit(completion)  # [0, 0.18]
+    lower = -0.95
+    spread = 0.60
+    reward = lower + spread * base_credit
+    # Deterministic micro-jitter keeps rewards non-identical within bad batches.
+    if text:
+        bucket = sum(ord(c) for c in text[:240]) % 41
+        jitter = (bucket / 40.0 - 0.5) * 0.08
+        reward += jitter
+    reward -= _length_budget_penalty(role, text)
+    return round(max(-1.0, min(-0.2, reward)), 4)
 
 
 def _normalized_cross_conflict_penalty(
@@ -180,7 +212,7 @@ def aman_reward_fn(
 
         aman_action = parse_aman_action(completion)
         if aman_action is None:
-            rewards.append(-0.8)
+            rewards.append(_controller_failure_reward(completion, "AMAN"))
             continue
 
         dman_slots = _parse_slots_json(dman_json)
@@ -209,10 +241,17 @@ def aman_reward_fn(
                 missing += 1
 
         arr_count = max(1, len(arrivals))
+        parsed_slot_count = len(aman_action.arrival_slots)
+        emg_total = sum(
+            1 for f in arrivals if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+        )
         budget = task.delay_budget / 2.0
-        delay_eff = max(0.0, 1.0 - delay_total / max(1, budget))
+        # If all flights are unscheduled, delay_total=0 which would give delay_eff=1.0
+        # (rewarding an empty plan). Clamp to 0 when nothing is scheduled.
+        _all_arr_missing = missing == len(arrivals) and len(arrivals) > 0
+        delay_eff = 0.0 if _all_arr_missing else max(0.0, 1.0 - delay_total / max(1, budget))
         coverage = 1.0 - missing / arr_count
-        emg_score = emg_ok / max(1, emg_ok + emg_miss) if (emg_ok + emg_miss) else 1.0
+        emg_score = emg_ok / max(1, emg_ok + emg_miss) if emg_total > 0 else 0.5
 
         cross_penalty = 0.0
         if {s.runway for s in aman_action.arrival_slots} & {s.runway for s in dman_slots}:
@@ -232,25 +271,39 @@ def aman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
-        reward = (
-            0.26 * delay_eff
-            + 0.20 * emg_score
-            + 0.17 * coverage
-            + 0.12 * cf_advantage
-            + 0.10 * tom_bonus
-            + 0.05 * sup_align
-            + 0.05 * rationale_score
-            + 0.05 * json_fmt
-            - cross_penalty
+        parse_valid_bonus = 0.08
+        slot_validity = min(1.0, parsed_slot_count / arr_count)
+        parse_progress = 0.5 * json_fmt + 0.5 * slot_validity
+        long_horizon_gate = max(0.25, parse_progress)
+        long_horizon = _weighted_active_mean(
+            [
+                (outcome.metrics.connection_impact_score, 0.45, True),
+                (outcome.metrics.fairness, 0.25, True),
+                (outcome.metrics.fuel_efficiency, 0.20, True),
+                (outcome.metrics.schedule_completeness, 0.10, True),
+            ]
         )
-
-        # Layered safety gates — hard ceilings that cannot be bought off by efficiency
-        if outcome.metrics.conflict_count > 0:
-            reward = min(reward, 0.30)   # conflict-free gate
-        if emg_miss > 0:
-            reward = min(reward, 0.40)   # emergency hard gate
-        if coverage < 0.50:
-            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
+        reward = _weighted_active_mean(
+            [
+                (delay_eff, 0.22, True),
+                (coverage, 0.18, True),
+                (cf_advantage, 0.15, True),
+                (tom_bonus, 0.10, True),
+                (emg_score, 0.14, emg_total > 0),
+                (sup_align, 0.06, True),
+                (rationale_score, 0.05, True),
+                (json_fmt, 0.04, True),
+                (long_horizon * long_horizon_gate, 0.06, True),
+            ]
+        )
+        reward += parse_valid_bonus
+        reward -= cross_penalty
+        reward -= _length_budget_penalty("AMAN", completion)
+        # Smooth safety penalties preserve ranking signal for GRPO.
+        conflict_penalty = min(0.55, 0.55 * outcome.metrics.conflict_count / max(1, len(task.flights) - 1))
+        emg_penalty = 0.35 * (emg_miss / max(1, emg_total)) if emg_total > 0 else 0.0
+        coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
+        reward -= conflict_penalty + emg_penalty + coverage_penalty
 
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
@@ -264,10 +317,13 @@ def aman_reward_fn(
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
                 "json_fmt": json_fmt,
+                "parse_valid_bonus": parse_valid_bonus,
+                "slot_validity": slot_validity,
+                "long_horizon_gate": long_horizon_gate,
                 "cross_penalty": -cross_penalty,
-                "conflict_gate": int(outcome.metrics.conflict_count > 0),
-                "emg_gate": int(emg_miss > 0),
-                "coverage_floor": int(coverage < 0.50),
+                "conflict_penalty": -conflict_penalty,
+                "emg_penalty": -emg_penalty,
+                "coverage_penalty": -coverage_penalty,
                 "final_reward": reward,
             },
         )
@@ -316,7 +372,7 @@ def dman_reward_fn(
 
         dman_action = parse_dman_action(completion)
         if dman_action is None:
-            rewards.append(-0.8)
+            rewards.append(_controller_failure_reward(completion, "DMAN"))
             continue
 
         aman_slots = _parse_slots_json(aman_json)
@@ -353,11 +409,17 @@ def dman_reward_fn(
                 missing += 1
 
         dep_count = max(1, len(departures))
+        parsed_slot_count = len(dman_action.departure_slots)
+        emg_total = sum(
+            1 for f in departures if f.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+        )
         budget = task.delay_budget / 2.0
-        delay_eff = max(0.0, 1.0 - delay_total / max(1, budget))
+        _all_dep_missing = missing == len(departures) and len(departures) > 0
+        delay_eff = 0.0 if _all_dep_missing else max(0.0, 1.0 - delay_total / max(1, budget))
         coverage = 1.0 - missing / dep_count
-        emg_score = emg_ok / max(1, emg_ok + emg_miss) if (emg_ok + emg_miss) else 1.0
-        atfm_score = atfm_ok / max(1, atfm_ok + atfm_viol) if (atfm_ok + atfm_viol) else 1.0
+        emg_score = emg_ok / max(1, emg_ok + emg_miss) if emg_total > 0 else 0.5
+        atfm_count = atfm_ok + atfm_viol
+        atfm_score = atfm_ok / max(1, atfm_count) if atfm_count > 0 else 0.5
 
         cross_penalty = 0.0
         if {s.runway for s in dman_action.departure_slots} & {s.runway for s in aman_slots}:
@@ -377,26 +439,39 @@ def dman_reward_fn(
         cf_advantage = max(-1.0, min(1.0, outcome.normalized_score - cf_outcome.normalized_score))
 
         json_fmt = _json_format_score(completion)
-        reward = (
-            0.23 * delay_eff
-            + 0.17 * atfm_score
-            + 0.16 * emg_score
-            + 0.12 * coverage
-            + 0.12 * cf_advantage
-            + 0.10 * tom_bonus
-            + 0.05 * sup_align
-            + 0.03 * rationale_score
-            + 0.02 * json_fmt
-            - cross_penalty
+        parse_valid_bonus = 0.08
+        slot_validity = min(1.0, parsed_slot_count / dep_count)
+        parse_progress = 0.5 * json_fmt + 0.5 * slot_validity
+        long_horizon_gate = max(0.25, parse_progress)
+        long_horizon = _weighted_active_mean(
+            [
+                (outcome.metrics.connection_impact_score, 0.45, True),
+                (outcome.metrics.fairness, 0.25, True),
+                (outcome.metrics.fuel_efficiency, 0.20, True),
+                (outcome.metrics.schedule_completeness, 0.10, True),
+            ]
         )
-
-        # Layered safety gates
-        if outcome.metrics.conflict_count > 0:
-            reward = min(reward, 0.30)   # conflict-free gate
-        if emg_miss > 0:
-            reward = min(reward, 0.40)   # emergency hard gate
-        if coverage < 0.50:
-            reward = max(-0.5, reward - 0.30)  # coverage floor penalty
+        reward = _weighted_active_mean(
+            [
+                (delay_eff, 0.19, True),
+                (coverage, 0.14, True),
+                (cf_advantage, 0.14, True),
+                (tom_bonus, 0.10, True),
+                (atfm_score, 0.14, atfm_count > 0),
+                (emg_score, 0.12, emg_total > 0),
+                (sup_align, 0.05, True),
+                (rationale_score, 0.04, True),
+                (json_fmt, 0.03, True),
+                (long_horizon * long_horizon_gate, 0.05, True),
+            ]
+        )
+        reward += parse_valid_bonus
+        reward -= cross_penalty
+        reward -= _length_budget_penalty("DMAN", completion)
+        conflict_penalty = min(0.55, 0.55 * outcome.metrics.conflict_count / max(1, len(task.flights) - 1))
+        emg_penalty = 0.35 * (emg_miss / max(1, emg_total)) if emg_total > 0 else 0.0
+        coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
+        reward -= conflict_penalty + emg_penalty + coverage_penalty
 
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
@@ -411,10 +486,13 @@ def dman_reward_fn(
                 "sup_align": sup_align,
                 "rationale_score": rationale_score,
                 "json_fmt": json_fmt,
+                "parse_valid_bonus": parse_valid_bonus,
+                "slot_validity": slot_validity,
+                "long_horizon_gate": long_horizon_gate,
                 "cross_penalty": -cross_penalty,
-                "conflict_gate": int(outcome.metrics.conflict_count > 0),
-                "emg_gate": int(emg_miss > 0),
-                "coverage_floor": int(coverage < 0.50),
+                "conflict_penalty": -conflict_penalty,
+                "emg_penalty": -emg_penalty,
+                "coverage_penalty": -coverage_penalty,
                 "final_reward": reward,
             },
         )
@@ -452,8 +530,16 @@ def generator_reward_fn(
             rewards.append(-0.5)
             continue
 
-        _, is_solvable = _GENERATOR.mutate(task, gen_action)
-        reward = _GENERATOR.compute_reward(_safe_float(ctrl_score), is_solvable)
+        try:
+            _, is_solvable = _GENERATOR.mutate(task, gen_action)
+            reward = _GENERATOR.compute_reward(_safe_float(ctrl_score), is_solvable)
+        except Exception as exc:
+            # LLM may emit invalid param types (e.g. flight_id as int).
+            # Penalise but don't crash training — the source bug is also fixed
+            # in generator.py, but this guard handles any future schema drift.
+            if _TRACE_REWARDS:
+                print(f"[REWARD TRACE] generator mutate failed: {exc}")
+            reward = -0.4 + _parse_partial_credit(completion)
         rewards.append(round(max(-1.0, min(1.0, reward)), 4))
 
     return rewards
@@ -512,142 +598,16 @@ def supervisor_reward_fn(
     return rewards
 
 
-def adapt_reward_fn(
-    completions: List[str],
-    task_id: List[str],
-    domain_task_json: Optional[List[str]] = None,
-    supervisor_profile: Optional[List[str]] = None,
-    **kwargs: Any,
-) -> List[float]:
-    """GRPO reward for ADAPT — downstream signal from heuristic AMAN+DMAN episode.
-
-    Parses ADAPTAction from completion → applies mapping → runs heuristic AMAN/DMAN
-    on the mapped task → returns composite_score as reward signal.
-    """
-    rewards: List[float] = []
-    n = len(completions)
-
-    domain_task_json = _metadata_list(
-        domain_task_json if domain_task_json is not None else kwargs.get("domain_task_json"),
-        n,
-        None,
-    )
-    supervisor_profile = _metadata_list(
-        supervisor_profile if supervisor_profile is not None else kwargs.get("supervisor_profile"),
-        n,
-        _DEFAULT_SUPERVISOR_PROFILE.value,
-    )
-
-    _adapt_env = MultiAgentATCEnvironment(seed=0)
-
-    for completion, dtask_json, profile_str in zip(
-        completions, domain_task_json, supervisor_profile
-    ):
-        if not dtask_json:
-            rewards.append(-1.0)
-            continue
-
-        try:
-            from models import TaskDefinition as _TD
-            domain_task = _TD.model_validate_json(dtask_json)
-        except Exception:
-            rewards.append(-1.0)
-            continue
-
-        adapt_action = parse_adapt_action(completion)
-        if adapt_action is None:
-            rewards.append(-0.5)
-            continue
-
-        # Penalise degenerate priority distributions before even running the episode.
-        # Over-mapping to emergency causes AMAN starvation and score collapse.
-        distribution_penalty = _adapt_distribution_penalty(adapt_action)
-
-        mapped_task = apply_adapt_mapping(domain_task, adapt_action)
-        profile = _safe_supervisor_profile(profile_str)
-
-        try:
-            aman_obs, dman_obs = _adapt_env.reset(
-                episode_id=0,
-                supervisor_profile=profile,
-                mutated_task=mapped_task,
-            )
-            atfm_deadlines = _adapt_env._state.atfm_deadlines
-
-            aman_action = _build_aman_heuristic(aman_obs)
-            dman_action = _build_dman_heuristic(dman_obs, atfm_deadlines)
-
-            all_slots = aman_action.arrival_slots + dman_action.departure_slots
-            outcome = simulate_plan(mapped_task, all_slots)
-
-            # Baseline: heuristic on unmapped task (ADAPT mapping adds zero value if no change)
-            aman_obs_base, dman_obs_base = _adapt_env.reset(
-                episode_id=0,
-                supervisor_profile=profile,
-                mutated_task=domain_task,
-            )
-            atfm_base = _adapt_env._state.atfm_deadlines
-            aman_base = _build_aman_heuristic(aman_obs_base)
-            dman_base = _build_dman_heuristic(dman_obs_base, atfm_base)
-            base_slots = aman_base.arrival_slots + dman_base.departure_slots
-            base_outcome = simulate_plan(domain_task, base_slots)
-
-            improvement = outcome.normalized_score - base_outcome.normalized_score
-            rationale_bonus = min(0.10, len(adapt_action.rationale.strip()) / 500.0)
-            reward = max(-1.0, min(1.0,
-                outcome.normalized_score
-                + 0.15 * improvement
-                + rationale_bonus
-                - distribution_penalty
-            ))
-        except Exception:
-            reward = max(-1.0, -0.5 - distribution_penalty)
-
-        rewards.append(round(reward, 4))
-
-    return rewards
-
-
-def _adapt_distribution_penalty(action: "ADAPTAction") -> float:  # type: ignore[name-defined]
-    """Penalise degenerate priority distributions that cause AMAN/DMAN starvation.
-
-    Two violations, each worth up to 0.30:
-      1. emergency_overuse: more than 1 entity type mapped to emergency
-         → penalty = 0.30 × (excess_count / n_types)
-      2. high_tier_concentration: >60% of entity types mapped to emergency+medical
-         → penalty = 0.30 × (concentration − 0.60) / 0.40  [scales 0→0.30]
-
-    Total penalty is capped at 0.50 so a correct mapping is never blocked from
-    achieving a positive reward.
-    """
-    pri_map = action.entity_priority_map
-    if not pri_map:
-        return 0.0
-
-    n_types = len(pri_map)
-    emergency_count = sum(1 for v in pri_map.values() if v == PriorityClass.EMERGENCY.value)
-    medical_count   = sum(1 for v in pri_map.values() if v == PriorityClass.MEDICAL.value)
-    high_tier_count = emergency_count + medical_count
-
-    # Penalty 1: more than 1 emergency type
-    excess_emg = max(0, emergency_count - 1)
-    emg_penalty = 0.30 * (excess_emg / n_types) if excess_emg > 0 else 0.0
-
-    # Penalty 2: >60% of types at high tier (emergency + medical)
-    concentration = high_tier_count / n_types
-    conc_penalty = 0.0
-    if concentration > 0.60:
-        conc_penalty = 0.30 * min(1.0, (concentration - 0.60) / 0.40)
-
-    return round(min(0.50, emg_penalty + conc_penalty), 4)
-
-
 def _json_format_score(completion: Any) -> float:
     """Returns 1.0 if completion contains valid JSON with expected keys, else 0.0."""
     text = _coerce_completion_text(completion)
     try:
-        # Strip markdown code fences if present
-        stripped = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
+        stripped = re.sub(r"```[a-zA-Z]*\s*", "", text)
+        stripped = re.sub(r"```", "", stripped).strip()
+        # Normalise Python literals before parsing
+        stripped = re.sub(r"\bTrue\b", "true", stripped)
+        stripped = re.sub(r"\bFalse\b", "false", stripped)
+        stripped = re.sub(r"\bNone\b", "null", stripped)
         data = json.loads(stripped)
         if isinstance(data, dict) and (
             "arrival_slots" in data or "departure_slots" in data or "rationale" in data
@@ -659,6 +619,55 @@ def _json_format_score(completion: Any) -> float:
         if "{" in text and ("slots" in text or "rationale" in text):
             return 0.2
         return 0.0
+
+
+def _parse_partial_credit(completion: Any) -> float:
+    """Partial credit for completions that fail JSON parsing.
+
+    GRPO advantage = (r - mean) / std. If ALL completions in a group get
+    identical rewards, std=0 → advantage=0 → zero gradient. This function
+    ensures rewards in [-0.80, -0.62] vary even when parsing fails completely,
+    including when the model outputs natural language instead of JSON.
+
+    Credit tiers (cumulative, capped at 0.18):
+      +0.03  any substantive text (> 20 chars)
+      +0.02  longer response (> 100 chars, shows more effort)
+      +0.04  has { (attempted JSON)
+      +0.05  has slot key (arrival_slots / departure_slots / slots)
+      +0.04  has flight_id key or pattern
+      +0.03  has runway key or pattern
+      +0.02  has rationale key
+      -0.04  very short (< 20 chars, penalise lazy/empty outputs)
+    """
+    text = _coerce_completion_text(completion)
+    if not text or not text.strip():
+        return 0.0
+
+    tl = text.lower()
+    score = 0.0
+
+    # Natural-language responses still get some credit so they vary from empty
+    if len(text.strip()) > 20:
+        score += 0.03
+    if len(text.strip()) > 100:
+        score += 0.02
+
+    # JSON structure markers
+    if "{" in text:
+        score += 0.04
+    if any(k in tl for k in ("arrival_slots", "departure_slots", '"slots"', "'slots'")):
+        score += 0.05
+    if "flight_id" in tl:
+        score += 0.04
+    if "runway" in tl:
+        score += 0.03
+    if "rationale" in tl:
+        score += 0.02
+
+    if len(text.strip()) < 20:
+        score = max(0.0, score - 0.04)
+
+    return round(min(0.18, score), 4)
 
 
 def _score_rationale_quality(
@@ -959,4 +968,10 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
         rewards.append(reward)
 
     return rewards
+
+
+def _debug_reward_trace(role: str, metrics: Dict[str, float]) -> None:
+    """Optional trace log for reward components during local debugging."""
+    if os.getenv("ATC_REWARD_TRACE") == "1":
+        print(f"[TRACE] role={role} " + " ".join(f"{k}={v:.3f}" for k, v in metrics.items()))
 

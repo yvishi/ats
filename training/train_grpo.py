@@ -32,9 +32,12 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import logging
 import os
+import re
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,6 +77,7 @@ from training.dataset import (
     build_episode_dataset,
     parse_aman_action,
     parse_dman_action,
+    parse_generator_action,
 )
 from training.reward_functions import (
     aman_reward_fn,
@@ -97,20 +101,140 @@ LORA_RANK      = 16
 LORA_ALPHA     = 32
 LORA_TARGETS   = ["q_proj", "v_proj", "k_proj", "o_proj"]
 MAX_SEQ_LEN    = 4096
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 384
 TEMPERATURE    = 0.7
+# Role-aware generation budgets. GRPO supports one global max token cap, so we
+# use the max here and enforce per-role compactness in rewards/logging.
+ROLE_MAX_NEW_TOKENS = {
+    AgentRole.AMAN.value: 384,
+    AgentRole.DMAN.value: 384,
+    AgentRole.GENERATOR.value: 224,
+    AgentRole.SUPERVISOR.value: 160,
+}
 # 4 generations per prompt: minimum group size for a stable GRPO advantage estimate.
 # With N=2 the group std is near-zero, making the normalised advantage meaningless.
 N_GENERATIONS  = 4
-BATCH_SIZE     = 2
-GRAD_ACCUM     = 4           # effective batch = 8
+BATCH_SIZE     = 4
+GRAD_ACCUM     = 2           # effective batch = 8
 LR             = 5e-5
 # In trl==0.16.0 + unsloth==2026.4.7 with PEFT, non-zero KL can fail when
 # ref_per_token_logps is absent in the fast path (ref=None crash).
 KL_COEFF       = 0.0
 WARMUP_RATIO   = 0.05
+LOGGING_STEPS  = 1
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
+EVAL_EPISODES  = 20
+STAGE_EPOCHS = {
+    "stage_a": 0.45,  # AMAN + DMAN only
+    "stage_b": 0.30,  # add sampled generator/supervisor
+    "stage_c": 0.25,  # full 4-role mix
+}
+
+
+def _configure_runtime_warnings() -> None:
+    """Hide repetitive upstream warnings that don't affect correctness."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Both `max_new_tokens` \(=.*\) and `max_length`\(=.*\) seem to have been set\..*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Passing `generation_config` together with generation-related arguments=.* is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The attention mask API under `transformers\.modeling_attn_mask_utils`.*deprecated.*",
+        category=FutureWarning,
+    )
+    # Some transformers builds emit this through logging, not warnings.
+    class _SuppressMaxLenWarning(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return "Both `max_new_tokens`" not in msg
+
+    for name in (
+        "transformers.generation.utils",
+        "transformers.generation.configuration_utils",
+    ):
+        logging.getLogger(name).addFilter(_SuppressMaxLenWarning())
+
+
+def _auto_tune_for_gpu(torch_module) -> Dict[str, int]:
+    """Return tuned batch/accum/token settings based on detected VRAM."""
+    tuned = {
+        "batch_size": BATCH_SIZE,
+        "grad_accum": GRAD_ACCUM,
+        "max_new_tokens": MAX_NEW_TOKENS,
+    }
+    if not torch_module.cuda.is_available():
+        return tuned
+    try:
+        vram_gb = torch_module.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return tuned
+
+    # 80GB-class GPUs: increase throughput while keeping rollout quality.
+    if vram_gb >= 70:
+        tuned["batch_size"] = max(tuned["batch_size"], 8)
+        tuned["grad_accum"] = 1
+        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 384)
+    elif vram_gb >= 40:
+        tuned["batch_size"] = max(tuned["batch_size"], 6)
+        tuned["grad_accum"] = min(tuned["grad_accum"], 2)
+        tuned["max_new_tokens"] = min(tuned["max_new_tokens"], 384)
+    return tuned
+
+
+def _prefer_local_model_path(model_name: str) -> str:
+    """Use local HF cache path when available to avoid network flakiness."""
+    if os.path.isdir(model_name):
+        return model_name
+    try:
+        from huggingface_hub import snapshot_download
+
+        local_path = snapshot_download(repo_id=model_name, local_files_only=True)
+        print(f"[INFO] Using local model snapshot cache: {local_path}")
+        return local_path
+    except Exception:
+        return model_name
+
+
+def _is_transient_network_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "temporary failure in name resolution",
+        "name resolution",
+        "connecterror",
+        "connection error",
+        "failed to establish a new connection",
+    )
+    return any(n in msg for n in needles)
+
+
+def _load_model_with_fallback(
+    FastLanguageModel,
+    model_source: str,
+    *,
+    max_seq_length: int,
+):
+    """Load model/tokenizer, retrying in offline mode on DNS/network failures."""
+    kwargs = {
+        "model_name": model_source,
+        "max_seq_length": max_seq_length,
+        "load_in_4bit": True,
+        "dtype": None,
+    }
+    try:
+        return FastLanguageModel.from_pretrained(**kwargs)
+    except Exception as exc:
+        if not _is_transient_network_error(exc):
+            raise
+        print("[WARN] Network/DNS issue while loading tokenizer/model. Retrying from local cache...")
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        kwargs["local_files_only"] = True
+        return FastLanguageModel.from_pretrained(**kwargs)
 
 
 # ── Role-dispatch table ───────────────────────────────────────────────────────
@@ -120,7 +244,7 @@ REWARD_FN_DISPATCH = {
     AgentRole.DMAN.value:       dman_reward_fn,
     AgentRole.GENERATOR.value:  generator_reward_fn,
     AgentRole.SUPERVISOR.value: supervisor_reward_fn,
-    AgentRole.ADAPT.value:      adapt_reward_fn,       # meta-agent: domain transfer
+    AgentRole.ADAPT.value:      adapt_reward_fn,
 }
 
 
@@ -359,6 +483,74 @@ def _select_sample_value(value: Any, index: int) -> Any:
     return value
 
 
+def _expand_to_completion_length(
+    value: Any,
+    target_len: int,
+    *,
+    field_name: str,
+    num_generations: int,
+) -> List[Any]:
+    """Align prompt-level metadata with completion-level batches."""
+    if not isinstance(value, list):
+        return [value] * target_len
+    current_len = len(value)
+    if current_len == target_len:
+        return value
+    if current_len == 0:
+        return [None] * target_len
+    if current_len * max(1, num_generations) == target_len:
+        expanded: List[Any] = []
+        for item in value:
+            expanded.extend([item] * max(1, num_generations))
+        return expanded
+    if target_len % current_len == 0:
+        factor = target_len // current_len
+        expanded = []
+        for item in value:
+            expanded.extend([item] * factor)
+        return expanded
+    raise RuntimeError(
+        f"Metadata alignment error for '{field_name}': len={current_len}, "
+        f"target={target_len}, num_generations={num_generations}"
+    )
+
+
+def _build_curriculum_slices(dataset_raw: List[Dict[str, Any]], seed: int) -> Dict[str, List[Dict[str, Any]]]:
+    """Create staged role mixes for pure-GRPO curriculum."""
+    import random
+
+    rng = random.Random(seed)
+    stage_a = [
+        row for row in dataset_raw
+        if row.get("agent_role") in (AgentRole.AMAN.value, AgentRole.DMAN.value)
+    ]
+    gen_sup = [
+        row for row in dataset_raw
+        if row.get("agent_role") in (AgentRole.GENERATOR.value, AgentRole.SUPERVISOR.value)
+    ]
+    rng.shuffle(gen_sup)
+    keep = int(0.35 * len(gen_sup))
+    stage_b = stage_a + gen_sup[:keep]
+    stage_c = list(dataset_raw)
+    return {"stage_a": stage_a, "stage_b": stage_b, "stage_c": stage_c}
+
+
+def _tail_rate(values: List[int], window: int = 128) -> float:
+    if not values:
+        return 0.0
+    tail = values[-min(window, len(values)) :]
+    return sum(tail) / max(1, len(tail))
+
+
+def _parse_quality_gates(parse_log: Dict[str, List[int]], fallback_log: Dict[str, List[int]]) -> Dict[str, float]:
+    return {
+        "parse_aman": _tail_rate(parse_log.get("AMAN", []), 128),
+        "parse_dman": _tail_rate(parse_log.get("DMAN", []), 128),
+        "fallback_aman": _tail_rate(fallback_log.get("AMAN", []), 128),
+        "fallback_dman": _tail_rate(fallback_log.get("DMAN", []), 128),
+    }
+
+
 # ── Unified reward dispatcher ─────────────────────────────────────────────────
 
 def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
@@ -367,20 +559,26 @@ def combined_reward_fn(completions: List[str], **kwargs) -> List[float]:
     TRL GRPOTrainer calls this with a batch of completions.
     kwargs contains per-sample metadata from the dataset.
     """
-    roles = kwargs.get("agent_role", [AgentRole.AMAN.value] * len(completions))
-    if not isinstance(roles, list):
-        roles = [roles] * len(completions)
-    elif len(roles) < len(completions):
-        roles = roles + [roles[-1] if roles else AgentRole.AMAN.value] * (
-            len(completions) - len(roles)
+    target_len = len(completions)
+    normalized_kwargs: Dict[str, List[Any]] = {}
+    for key, value in kwargs.items():
+        normalized_kwargs[key] = _expand_to_completion_length(
+            value,
+            target_len,
+            field_name=key,
+            num_generations=N_GENERATIONS,
         )
+
+    roles = normalized_kwargs.get("agent_role", [AgentRole.AMAN.value] * target_len)
+    if not roles:
+        roles = [AgentRole.AMAN.value] * target_len
 
     rewards: List[float] = []
     failure_mode = _reward_failure_mode()
 
     for i, (completion, role) in enumerate(zip(completions, roles)):
         fn = REWARD_FN_DISPATCH.get(role, aman_reward_fn)
-        sample_kwargs = {k: [_select_sample_value(v, i)] for k, v in kwargs.items()}
+        sample_kwargs = {k: [_select_sample_value(v, i)] for k, v in normalized_kwargs.items()}
         try:
             r = fn([completion], **sample_kwargs)
             if not r:
@@ -404,13 +602,21 @@ def train(
     n_episodes:   int  = 200,
     lora_rank:    int  = LORA_RANK,
     seed:         int  = 42,
+    eval_episodes: int = EVAL_EPISODES,
     push_to_hub:  bool = False,
     hub_model_id: Optional[str] = None,
     run_eval:     bool = True,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
+    _configure_runtime_warnings()
+    from transformers import TrainerCallback
 
-    num_generations = _resolve_num_generations(BATCH_SIZE, N_GENERATIONS)
+    tuned = _auto_tune_for_gpu(torch)
+    batch_size = tuned["batch_size"]
+    grad_accum = tuned["grad_accum"]
+    max_new_tokens = max(tuned["max_new_tokens"], max(ROLE_MAX_NEW_TOKENS.values()))
+
+    num_generations = _resolve_num_generations(batch_size, N_GENERATIONS)
     if num_generations != N_GENERATIONS:
         print(
             f"[WARN] Adjusted num_generations {N_GENERATIONS} -> {num_generations} "
@@ -421,10 +627,22 @@ def train(
     print(f"  ATC Multi-Agent GRPO Training")
     print(f"  Model:        {model_name}")
     print(f"  Episodes:     {n_episodes}")
+    print(f"  Eval eps:     {eval_episodes}")
     print(f"  Generations:  {num_generations} per prompt")
     print(f"  Output:       {output_dir}")
     device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     print(f"  Device:       {device_str}")
+    print(
+        f"  Tune:         batch={batch_size}, accum={grad_accum}, "
+        f"max_new_tokens={max_new_tokens}, temp={TEMPERATURE}, logging_steps={LOGGING_STEPS}"
+    )
+    print(
+        "  Role tokens:  "
+        f"AMAN={ROLE_MAX_NEW_TOKENS[AgentRole.AMAN.value]}, "
+        f"DMAN={ROLE_MAX_NEW_TOKENS[AgentRole.DMAN.value]}, "
+        f"GEN={ROLE_MAX_NEW_TOKENS[AgentRole.GENERATOR.value]}, "
+        f"SUP={ROLE_MAX_NEW_TOKENS[AgentRole.SUPERVISOR.value]}"
+    )
     print(f"{'='*60}\n")
 
     # ── 1. Capture pre-training baseline metrics ──────────────────────────────
@@ -436,12 +654,15 @@ def train(
 
     # ── 2. Load model ─────────────────────────────────────────────────────────
     print("[1/5] Loading model with Unsloth 4-bit QLoRA...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
+    model_source = _prefer_local_model_path(model_name)
+    model, tokenizer = _load_model_with_fallback(
+        FastLanguageModel,
+        model_source,
         max_seq_length=MAX_SEQ_LEN,
-        load_in_4bit=True,
-        dtype=None,
     )
+    # Prevent generate() ambiguity warnings from inherited max_length defaults.
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.max_length = None
     model = FastLanguageModel.get_peft_model(
         model,
         r=lora_rank,
@@ -461,7 +682,7 @@ def train(
         print("\n[1.5/5] Measuring base model score (untrained LoRA)...")
         model.eval()
         base_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="BASE MODEL (no fine-tune)"
+            model, tokenizer, n_episodes=eval_episodes, tag="BASE MODEL (no fine-tune)"
         )
         model.train()
         _save_json(base_model_metrics, Path(output_dir) / "base_model_metrics.json")
@@ -480,8 +701,8 @@ def train(
         include_adapt=True,
         domain_episode_ratio=0.30,
     )
-    print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
 
+    print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
 
     role_counts: Dict[str, int] = {}
     for s in dataset_raw:
@@ -492,10 +713,18 @@ def train(
 
     try:
         from datasets import Dataset
-        dataset = Dataset.from_list(dataset_raw)
+        stage_slices = _build_curriculum_slices(dataset_raw, seed=seed)
+        stage_datasets = {
+            name: Dataset.from_list(rows) for name, rows in stage_slices.items() if rows
+        }
     except ImportError:
         print("[ERROR] pip install datasets")
         sys.exit(1)
+    print("    Curriculum:")
+    for stage_name in ("stage_a", "stage_b", "stage_c"):
+        ds = stage_datasets.get(stage_name)
+        if ds is not None:
+            print(f"      {stage_name}: {len(ds)} samples")
 
     # ── 4. GRPO config ────────────────────────────────────────────────────────
     kl_coeff = _effective_kl_coeff()
@@ -506,11 +735,11 @@ def train(
         "num_generations":              num_generations,
         "temperature":                  TEMPERATURE,
         "learning_rate":                LR,
-        "per_device_train_batch_size":  BATCH_SIZE,
-        "gradient_accumulation_steps":  GRAD_ACCUM,
+        "per_device_train_batch_size":  batch_size,
+        "gradient_accumulation_steps":  grad_accum,
         "num_train_epochs":             1,
         "warmup_ratio":                 WARMUP_RATIO,
-        "logging_steps":                10,
+        "logging_steps":                LOGGING_STEPS,
         "save_steps":                   SAVE_STEPS,
         "save_total_limit":             SAVE_TOTAL_LIMIT,
         "output_dir":                   output_dir,
@@ -528,9 +757,9 @@ def train(
 
     # Compatibility shims for different TRL versions
     if _config_supports("max_completion_length", GRPOConfig):
-        grpo_kwargs["max_completion_length"] = MAX_NEW_TOKENS
+        grpo_kwargs["max_completion_length"] = max_new_tokens
     elif _config_supports("max_new_tokens", GRPOConfig):
-        grpo_kwargs["max_new_tokens"] = MAX_NEW_TOKENS
+        grpo_kwargs["max_new_tokens"] = max_new_tokens
 
     if _config_supports("beta", GRPOConfig):
         grpo_kwargs["beta"] = kl_coeff
@@ -547,13 +776,28 @@ def train(
 
     # Separate lists so we can show per-role curves in the demo
     reward_log: Dict[str, List[float]] = {
-        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "ADAPT": [], "composite": []
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "composite": []
     }
+    parse_log: Dict[str, List[int]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
+    }
+    fallback_log: Dict[str, List[int]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
+    }
+    overflow_log: Dict[str, List[int]] = {
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": []
+    }
+    parse_fail_samples: Dict[str, str] = {}
+    parse_fail_counts: Dict[str, int] = {
+        "AMAN": 0, "DMAN": 0, "GENERATOR": 0, "SUPERVISOR": 0
+    }
+    reward_call_count = 0
 
     class RewardLogger:
         __name__ = "combined_reward_fn"
 
         def __call__(self, *args, **kwargs):
+            nonlocal reward_call_count
             # TRL <0.17: reward_func(completions=..., **kwargs)
             # TRL >=0.17: reward_func(prompts, completions, **kwargs)
             if "completions" in kwargs:
@@ -578,6 +822,7 @@ def train(
                 completions = flattened
 
             rewards = combined_reward_fn(completions, **kwargs)
+            reward_call_count += 1
 
             roles = kwargs.get("agent_role", [])
             if not isinstance(roles, list):
@@ -587,15 +832,63 @@ def train(
                     roles[-1] if roles else AgentRole.AMAN.value
                 ] * (len(rewards) - len(roles))
 
-            for r, role in zip(rewards, roles):
+            def _is_parse_ok(role: str, completion: Any) -> int:
+                if role == AgentRole.AMAN.value:
+                    return 1 if parse_aman_action(completion) is not None else 0
+                if role == AgentRole.DMAN.value:
+                    return 1 if parse_dman_action(completion) is not None else 0
+                if role == AgentRole.GENERATOR.value:
+                    return 1 if parse_generator_action(completion) is not None else 0
+                if role == AgentRole.SUPERVISOR.value:
+                    text = str(completion)
+                    if re.search(r'"score"\s*:\s*-?\d+(?:\.\d+)?', text):
+                        return 1
+                    return 0
+                return 0
+
+            def _is_fallback(role: str, parse_ok: int, reward_value: float) -> int:
+                if role in (AgentRole.AMAN.value, AgentRole.DMAN.value):
+                    return 0 if parse_ok else 1
+                if role == AgentRole.GENERATOR.value:
+                    return 1 if reward_value <= -0.49 else 0
+                if role == AgentRole.SUPERVISOR.value:
+                    return 1 if reward_value <= -0.49 else 0
+                return 0
+
+            def _overflow(role: str, completion: Any) -> int:
+                budget = ROLE_MAX_NEW_TOKENS.get(role, max_new_tokens)
+                approx_tokens = len(str(completion).split())
+                return 1 if approx_tokens > budget else 0
+
+            for completion, r, role in zip(completions, rewards, roles):
+                parse_ok = _is_parse_ok(role, completion)
                 if role in reward_log:
                     reward_log[role].append(r)
+                if role in parse_log:
+                    parse_log[role].append(parse_ok)
+                if role in fallback_log:
+                    fallback_log[role].append(_is_fallback(role, parse_ok, float(r)))
+                if role in overflow_log:
+                    overflow_log[role].append(_overflow(role, completion))
+                if role in parse_fail_counts and parse_ok == 0:
+                    parse_fail_counts[role] += 1
+                    if role in (AgentRole.AMAN.value, AgentRole.DMAN.value):
+                        txt = re.sub(r"\s+", " ", str(completion)).strip()
+                        parse_fail_samples[role] = txt[:220]
                 reward_log["composite"].append(r)
 
             # Reward-hacking detection: warn when composite rises but per-role variance
             # collapses (all roles getting same score = likely gaming)
             if len(reward_log["composite"]) % 50 == 0 and len(reward_log["composite"]) > 50:
                 _check_reward_hacking(reward_log)
+            if reward_call_count % 25 == 0:
+                for role in (AgentRole.AMAN.value, AgentRole.DMAN.value):
+                    sample = parse_fail_samples.get(role)
+                    if sample:
+                        print(
+                            f"[PARSE_FAIL_SAMPLE] role={role} count={parse_fail_counts[role]} "
+                            f"sample='{sample}'"
+                        )
 
             return rewards
 
@@ -607,7 +900,7 @@ def train(
         "model":            model,
         "processing_class": tokenizer,
         "reward_funcs":     [reward_logger],
-        "train_dataset":    dataset,
+        "train_dataset":    stage_datasets.get("stage_a"),
     }
     if _trainer_supports("args", GRPOTrainer):
         trainer_kwargs["args"] = grpo_config
@@ -615,6 +908,78 @@ def train(
         trainer_kwargs["config"] = grpo_config
 
     trainer = GRPOTrainer(**trainer_kwargs)
+
+    class LiveMetricsCallback(TrainerCallback):
+        """Stream concise live metrics into notebook/stdout while training."""
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            logs = logs or {}
+            if not logs:
+                return
+            step = int(logs.get("step", getattr(state, "global_step", 0)) or 0)
+            max_steps = int(getattr(state, "max_steps", 0) or 0)
+            loss = logs.get("loss")
+            lr = logs.get("learning_rate")
+
+            def _avg_last(key: str, window: int = 64) -> float:
+                vals = reward_log.get(key, [])
+                if not vals:
+                    return float("nan")
+                tail = vals[-min(window, len(vals)) :]
+                return sum(tail) / max(1, len(tail))
+
+            def _fmt(v: float) -> str:
+                return "n/a" if v != v else f"{v:.3f}"
+            
+            def _parse_rate(role: str, window: int = 64) -> float:
+                vals = parse_log.get(role, [])
+                if not vals:
+                    return float("nan")
+                tail = vals[-min(window, len(vals)) :]
+                return sum(tail) / max(1, len(tail))
+
+            def _tail_rate(store: Dict[str, List[int]], role: str, window: int = 64) -> float:
+                vals = store.get(role, [])
+                if not vals:
+                    return float("nan")
+                tail = vals[-min(window, len(vals)) :]
+                return sum(tail) / max(1, len(tail))
+
+            comp = _avg_last("composite")
+            aman = _avg_last("AMAN")
+            dman = _avg_last("DMAN")
+            gen = _avg_last("GENERATOR")
+            sup = _avg_last("SUPERVISOR")
+            p_aman = _parse_rate("AMAN")
+            p_dman = _parse_rate("DMAN")
+            p_gen = _parse_rate("GENERATOR")
+            p_sup = _parse_rate("SUPERVISOR")
+            f_aman = _tail_rate(fallback_log, "AMAN")
+            f_dman = _tail_rate(fallback_log, "DMAN")
+            o_aman = _tail_rate(overflow_log, "AMAN")
+            o_dman = _tail_rate(overflow_log, "DMAN")
+            print(
+                "[LIVE] "
+                f"step={step}/{max_steps} "
+                f"loss={loss if loss is not None else 'n/a'} "
+                f"lr={lr if lr is not None else 'n/a'} "
+                f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
+                f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
+                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)} G={_fmt(p_gen)} S={_fmt(p_sup)}] "
+                f"fb64[A={_fmt(f_aman)} D={_fmt(f_dman)}] "
+                f"ovf64[A={_fmt(o_aman)} D={_fmt(o_dman)}]"
+            )
+
+    if hasattr(trainer, "add_callback"):
+        live_cb = LiveMetricsCallback()
+        # Fail fast before trainer.train() if callback API is incompatible.
+        missing = [name for name in ("on_train_begin", "on_log", "on_train_end") if not hasattr(live_cb, name)]
+        if missing:
+            raise RuntimeError(
+                "LiveMetricsCallback is incompatible with Trainer API; "
+                f"missing methods: {missing}"
+            )
+        trainer.add_callback(live_cb)
     
     # ── CRITICAL: Apply ALL compatibility patches BEFORE any training ──
     _maybe_patch_trainer_sampler(trainer)
@@ -648,9 +1013,97 @@ def train(
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
             print(f"[INFO] Deleted stale compiled cache: {cache_dir}")
-    
-    # Now train with fresh cache
-    trainer.train()
+
+    strict_gates = os.getenv("ATC_STRICT_GATES", "1").strip().lower() in {"1", "true", "yes", "on"}
+    stage_sequence = ["stage_a", "stage_b", "stage_c"]
+    stage_a_retries = 0
+
+    def _safe_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    def _optimization_gates() -> Dict[str, float]:
+        history = list(getattr(getattr(trainer, "state", None), "log_history", []) or [])
+        reward_std_vals = [
+            _safe_float(entry.get("reward_std"), 0.0)
+            for entry in history
+            if "reward_std" in entry
+        ]
+        clip_vals = [
+            _safe_float(entry.get("clip_ratio/region_mean"), 0.0)
+            for entry in history
+            if "clip_ratio/region_mean" in entry
+        ]
+        clip_nonzero_frac = (
+            sum(1 for v in clip_vals if v > 1e-8) / max(1, len(clip_vals))
+            if clip_vals else 0.0
+        )
+        reward_std_med = (
+            sorted(reward_std_vals)[len(reward_std_vals) // 2]
+            if reward_std_vals else 0.0
+        )
+        return {"clip_nonzero_frac": clip_nonzero_frac, "reward_std_median": reward_std_med}
+
+    for stage_name in stage_sequence:
+        ds = stage_datasets.get(stage_name)
+        if ds is None or len(ds) == 0:
+            continue
+        if hasattr(trainer, "train_dataset"):
+            trainer.train_dataset = ds
+        if hasattr(trainer, "_train_dataloader"):
+            trainer._train_dataloader = None
+        if hasattr(trainer, "args"):
+            trainer.args.num_train_epochs = STAGE_EPOCHS.get(stage_name, 0.25)
+        print(
+            f"\n[STAGE] {stage_name} samples={len(ds)} "
+            f"epochs={getattr(getattr(trainer, 'args', None), 'num_train_epochs', 'n/a')}"
+        )
+        trainer.train()
+
+        parse_gates = _parse_quality_gates(parse_log, fallback_log)
+        opt_gates = _optimization_gates()
+        print(
+            f"[GATE] {stage_name} "
+            f"parseA={parse_gates['parse_aman']:.3f} parseD={parse_gates['parse_dman']:.3f} "
+            f"fbA={parse_gates['fallback_aman']:.3f} fbD={parse_gates['fallback_dman']:.3f} "
+            f"clipNonZero={opt_gates['clip_nonzero_frac']:.3f} "
+            f"rewardStdMed={opt_gates['reward_std_median']:.4f}"
+        )
+
+        if stage_name == "stage_a":
+            parse_ok = (
+                parse_gates["parse_aman"] >= 0.85
+                and parse_gates["parse_dman"] >= 0.85
+            )
+            if not parse_ok and stage_a_retries < 1:
+                stage_a_retries += 1
+                if hasattr(trainer, "args"):
+                    trainer.args.num_train_epochs = 0.20
+                print("[GATE] Stage A parse gate missed; running one extra controller-only pass.")
+                trainer.train()
+                parse_gates = _parse_quality_gates(parse_log, fallback_log)
+                print(
+                    f"[GATE] stage_a_retry parseA={parse_gates['parse_aman']:.3f} "
+                    f"parseD={parse_gates['parse_dman']:.3f}"
+                )
+            if strict_gates and not (
+                parse_gates["parse_aman"] >= 0.75 and parse_gates["parse_dman"] >= 0.75
+            ):
+                raise RuntimeError(
+                    "Parse gate failed after Stage A: "
+                    f"AMAN={parse_gates['parse_aman']:.3f}, DMAN={parse_gates['parse_dman']:.3f}"
+                )
+        if strict_gates and (
+            opt_gates["clip_nonzero_frac"] < 0.20
+            or opt_gates["reward_std_median"] < 0.02
+        ):
+            raise RuntimeError(
+                f"Optimization gate failed in {stage_name}: "
+                f"clip_nonzero_frac={opt_gates['clip_nonzero_frac']:.3f}, "
+                f"reward_std_median={opt_gates['reward_std_median']:.4f}"
+            )
 
     # ── Save ──────────────────────────────────────────────────────────────────
     print(f"\nSaving model to {output_dir}...")
@@ -668,12 +1121,30 @@ def train(
         print("\n[Post] Measuring trained model score...")
         FastLanguageModel.for_inference(model)  # fuse LoRA weights for faster generation
         trained_model_metrics = _run_model_episodes(
-            model, tokenizer, n_episodes=3, tag="TRAINED MODEL"
+            model, tokenizer, n_episodes=eval_episodes, tag="TRAINED MODEL"
         )
         _save_json(trained_model_metrics, Path(output_dir) / "trained_model_metrics.json")
 
         if base_model_metrics is not None:
             _print_improvement(base_model_metrics, trained_model_metrics)
+            delta_comp = float(trained_model_metrics.get("mean_composite", 0.0)) - float(
+                base_model_metrics.get("mean_composite", 0.0)
+            )
+            delta_aman = float(trained_model_metrics.get("mean_aman_reward", 0.0)) - float(
+                base_model_metrics.get("mean_aman_reward", 0.0)
+            )
+            delta_dman = float(trained_model_metrics.get("mean_dman_reward", 0.0)) - float(
+                base_model_metrics.get("mean_dman_reward", 0.0)
+            )
+            print(
+                f"[GATE] quality delta_comp={delta_comp:+.3f} "
+                f"delta_aman={delta_aman:+.3f} delta_dman={delta_dman:+.3f}"
+            )
+            if strict_gates and not (delta_comp >= 0.0 and (delta_aman > 0.0 or delta_dman > 0.0)):
+                raise RuntimeError(
+                    "Quality gate failed: expected non-negative composite delta and at least one "
+                    "controller reward improvement."
+                )
         else:
             # Fallback: compare heuristic baseline vs trained model
             _print_improvement(
@@ -777,8 +1248,10 @@ class _LocalModelClient:
     def __init__(self, model, tokenizer):
         self._model = model
         self._tokenizer = tokenizer
+        if hasattr(self._model, "generation_config") and self._model.generation_config is not None:
+            self._model.generation_config.max_length = None
 
-    def _create(self, *, model=None, messages, temperature=0.3, max_tokens=512, **kw):
+    def _create(self, *, model=None, messages, temperature=0.3, max_tokens=MAX_NEW_TOKENS, **kw):
         import torch
         prompt = self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -791,7 +1264,7 @@ class _LocalModelClient:
                 with torch.autocast(device_type="cuda", dtype=cast_dtype):
                     out = self._model.generate(
                         **inputs,
-                        max_new_tokens=min(int(max_tokens), 512),
+                        max_new_tokens=min(int(max_tokens), MAX_NEW_TOKENS),
                         temperature=max(float(temperature), 0.01),
                         do_sample=float(temperature) > 0.01,
                         pad_token_id=self._tokenizer.eos_token_id,
@@ -799,7 +1272,7 @@ class _LocalModelClient:
             else:
                 out = self._model.generate(
                     **inputs,
-                    max_new_tokens=min(int(max_tokens), 512),
+                    max_new_tokens=min(int(max_tokens), MAX_NEW_TOKENS),
                     temperature=max(float(temperature), 0.01),
                     do_sample=float(temperature) > 0.01,
                     pad_token_id=self._tokenizer.eos_token_id,
@@ -955,11 +1428,17 @@ def _print_final_stats(reward_log: Dict[str, List[float]]) -> None:
 def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> Dict[str, Any]:
     """Run trained model on evaluation episodes."""
     torch, FastLanguageModel, _, _ = _require_training_deps()
+    _configure_runtime_warnings()
 
     print(f"\nEvaluating {model_name_or_path} on {n_episodes} episodes...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name_or_path, max_seq_length=MAX_SEQ_LEN, load_in_4bit=True,
+    model_source = _prefer_local_model_path(model_name_or_path)
+    model, tokenizer = _load_model_with_fallback(
+        FastLanguageModel,
+        model_source,
+        max_seq_length=MAX_SEQ_LEN,
     )
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.max_length = None
     FastLanguageModel.for_inference(model)
 
     import random
@@ -1058,6 +1537,12 @@ def main() -> None:
     parser.add_argument("--n_generations",  type=int, default=None,
                         help="GRPO group size (default: N_GENERATIONS constant). "
                              "Use 2 on T4 Colab, 4 for best gradient quality.")
+    parser.add_argument("--batch_size",     type=int, default=None)
+    parser.add_argument("--grad_accum",     type=int, default=None)
+    parser.add_argument("--max_new_tokens", type=int, default=None)
+    parser.add_argument("--temperature",    type=float, default=None)
+    parser.add_argument("--logging_steps",  type=int, default=None)
+    parser.add_argument("--eval_episodes",  type=int, default=EVAL_EPISODES)
     parser.add_argument("--seed",           type=int, default=42)
     parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
     parser.add_argument("--eval_only",      action="store_true")
@@ -1073,6 +1558,18 @@ def main() -> None:
         if BATCH_SIZE % N_GENERATIONS != 0:
             BATCH_SIZE = N_GENERATIONS
 
+    global GRAD_ACCUM, MAX_NEW_TOKENS, LOGGING_STEPS, TEMPERATURE
+    if args.batch_size is not None:
+        BATCH_SIZE = max(1, args.batch_size)
+    if args.grad_accum is not None:
+        GRAD_ACCUM = max(1, args.grad_accum)
+    if args.max_new_tokens is not None:
+        MAX_NEW_TOKENS = max(32, args.max_new_tokens)
+    if args.temperature is not None:
+        TEMPERATURE = max(0.1, min(1.5, args.temperature))
+    if args.logging_steps is not None:
+        LOGGING_STEPS = max(1, args.logging_steps)
+
     if args.eval_only:
         evaluate(args.model, n_episodes=20, seed=args.seed)
     else:
@@ -1082,6 +1579,7 @@ def main() -> None:
             n_episodes=args.episodes,
             lora_rank=args.lora_rank,
             seed=args.seed,
+            eval_episodes=max(3, args.eval_episodes),
             push_to_hub=args.push_to_hub,
             hub_model_id=args.hub_model_id,
             run_eval=not args.no_eval,
