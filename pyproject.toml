@@ -46,7 +46,6 @@ atc-train = "training.train_grpo:main"
 atc-eval = "training.eval:main"
 atc-plot = "training.plot_rewards:main"
 
-[tool.setuptools]
-include-package-data = true
-packages = ["atc_env", "atc_env.server", "atc_env.multi_agent", "atc_env.training"]
-package-dir = { "atc_env" = ".", "atc_env.server" = "server", "atc_env.multi_agent" = "multi_agent", "atc_env.training" = "training" }
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["atc_env*", "multi_agent*", "training*", "server*"]
