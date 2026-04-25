@@ -80,6 +80,7 @@ from training.reward_functions import (
     dman_reward_fn,
     generator_reward_fn,
     supervisor_reward_fn,
+    adapt_reward_fn,
 )
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
@@ -119,6 +120,7 @@ REWARD_FN_DISPATCH = {
     AgentRole.DMAN.value:       dman_reward_fn,
     AgentRole.GENERATOR.value:  generator_reward_fn,
     AgentRole.SUPERVISOR.value: supervisor_reward_fn,
+    AgentRole.ADAPT.value:      adapt_reward_fn,       # meta-agent: domain transfer
 }
 
 
@@ -542,7 +544,7 @@ def train(
 
     # Separate lists so we can show per-role curves in the demo
     reward_log: Dict[str, List[float]] = {
-        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "composite": []
+        "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "ADAPT": [], "composite": []
     }
 
     class RewardLogger:
