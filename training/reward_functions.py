@@ -31,6 +31,14 @@ try:
     from ..multi_agent.generator import ChallengeGenerator
     from ..multi_agent.models import SupervisorProfileName
     from ..multi_agent.supervisor import SupervisorAgent
+    from ..multi_agent.adapt import (
+        apply_adapt_mapping,
+        _build_adapt_heuristic,
+        build_adapt_observation,
+        parse_adapt_action,
+    )
+    from ..multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+    from ..multi_agent.environment import MultiAgentATCEnvironment
 except ImportError:
     import sys
 
@@ -47,6 +55,14 @@ except ImportError:
     from multi_agent.generator import ChallengeGenerator
     from multi_agent.models import SupervisorProfileName
     from multi_agent.supervisor import SupervisorAgent
+    from multi_agent.adapt import (
+        apply_adapt_mapping,
+        _build_adapt_heuristic,
+        build_adapt_observation,
+        parse_adapt_action,
+    )
+    from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+    from multi_agent.environment import MultiAgentATCEnvironment
 
 _CATALOG = None
 _SUPERVISOR = SupervisorAgent()
@@ -492,6 +508,93 @@ def supervisor_reward_fn(
             calibration_bonus = max(0.0, 0.2 - abs(supervisor_claimed - score))
 
         rewards.append(round(min(1.0, score + calibration_bonus), 4))
+
+    return rewards
+
+
+def adapt_reward_fn(
+    completions: List[str],
+    task_id: List[str],
+    domain_task_json: Optional[List[str]] = None,
+    supervisor_profile: Optional[List[str]] = None,
+    **kwargs: Any,
+) -> List[float]:
+    """GRPO reward for ADAPT — downstream signal from heuristic AMAN+DMAN episode.
+
+    Parses ADAPTAction from completion → applies mapping → runs heuristic AMAN/DMAN
+    on the mapped task → returns composite_score as reward signal.
+    """
+    rewards: List[float] = []
+    n = len(completions)
+
+    domain_task_json = _metadata_list(
+        domain_task_json if domain_task_json is not None else kwargs.get("domain_task_json"),
+        n,
+        None,
+    )
+    supervisor_profile = _metadata_list(
+        supervisor_profile if supervisor_profile is not None else kwargs.get("supervisor_profile"),
+        n,
+        _DEFAULT_SUPERVISOR_PROFILE.value,
+    )
+
+    _adapt_env = MultiAgentATCEnvironment(seed=0)
+
+    for completion, dtask_json, profile_str in zip(
+        completions, domain_task_json, supervisor_profile
+    ):
+        if not dtask_json:
+            rewards.append(-1.0)
+            continue
+
+        try:
+            from models import TaskDefinition as _TD
+            domain_task = _TD.model_validate_json(dtask_json)
+        except Exception:
+            rewards.append(-1.0)
+            continue
+
+        adapt_action = parse_adapt_action(completion)
+        if adapt_action is None:
+            rewards.append(-0.5)
+            continue
+
+        mapped_task = apply_adapt_mapping(domain_task, adapt_action)
+        profile = _safe_supervisor_profile(profile_str)
+
+        try:
+            aman_obs, dman_obs = _adapt_env.reset(
+                episode_id=0,
+                supervisor_profile=profile,
+                mutated_task=mapped_task,
+            )
+            atfm_deadlines = _adapt_env._state.atfm_deadlines
+
+            aman_action = _build_aman_heuristic(aman_obs)
+            dman_action = _build_dman_heuristic(dman_obs, atfm_deadlines)
+
+            all_slots = aman_action.arrival_slots + dman_action.departure_slots
+            outcome = simulate_plan(mapped_task, all_slots)
+
+            # Baseline: heuristic on unmapped task (ADAPT mapping adds zero value if no change)
+            aman_obs_base, dman_obs_base = _adapt_env.reset(
+                episode_id=0,
+                supervisor_profile=profile,
+                mutated_task=domain_task,
+            )
+            atfm_base = _adapt_env._state.atfm_deadlines
+            aman_base = _build_aman_heuristic(aman_obs_base)
+            dman_base = _build_dman_heuristic(dman_obs_base, atfm_base)
+            base_slots = aman_base.arrival_slots + dman_base.departure_slots
+            base_outcome = simulate_plan(domain_task, base_slots)
+
+            improvement = outcome.normalized_score - base_outcome.normalized_score
+            rationale_bonus = min(0.10, len(adapt_action.rationale.strip()) / 500.0)
+            reward = max(-1.0, min(1.0, outcome.normalized_score + 0.15 * improvement + rationale_bonus))
+        except Exception:
+            reward = -0.5
+
+        rewards.append(round(reward, 4))
 
     return rewards
 
