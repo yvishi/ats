@@ -6,7 +6,7 @@ import pytest
 from models import SlotAssignment, OperationType
 from tasks import task_catalog
 from engine import simulate_plan
-from multi_agent.environment import MultiAgentATCEnvironment
+from multi_agent.environment import MultiAgentATCEnvironment, count_separation_issues
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.supervisor import SupervisorAgent
 from multi_agent.models import (
@@ -44,6 +44,15 @@ def hard_task(catalog):
 
 
 # ── Environment reset ─────────────────────────────────────────────────────────
+
+def test_count_separation_issues_filters_diagnostics():
+    diags = [
+        "Runway 27 has A->B spaced 2 minutes apart; needs 3.",
+        "X exceeds the normal delay tolerance of 35 minutes.",
+        "Unknown flight id Z in proposal.",
+    ]
+    assert count_separation_issues(diags) == 1
+
 
 def test_reset_splits_flights_by_role(env, easy_task):
     aman_obs, dman_obs = env.reset(task_id=easy_task.task_id, episode_id=0)

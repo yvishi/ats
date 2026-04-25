@@ -327,6 +327,17 @@ KL_COEFF        = 0.01
 SAVE_STEPS      = 50
 ```
 
+### SFT cold-start (JSON I/O)
+
+Instruction checkpoints often misfire on the strict AMAN/DMAN/ADAPT JSON schema before any RL. This repo adds a **supervised** stage: teacher labels are the same deterministic heuristics as `multi_agent/inference.py`, serialized with `training/sft_schema.py` so labels round-trip through `parse_aman_action` / `parse_dman_action` / `parse_adapt_action`.
+
+```bash
+python training/build_sft_dataset.py --out data/atc_sft.jsonl --episodes 500
+python training/train_sft.py --dataset data/atc_sft.jsonl --output_dir ./outputs/atc-sft-json
+```
+
+Then merge the LoRA adapter into your base model (or wire the adapter path into your deployment) before GRPO or inference. Optional filters: `build_sft_dataset.py --no_negotiate`, `--no_adapt`; `train_sft.py --agent_role AMAN`.
+
 ---
 
 ## Scoring
@@ -455,6 +466,9 @@ From `constants.py`:
 | `domains/__init__.py` | Domain registry — add new transfer domains here |
 | `domains/icu.py` | ICU surge management — ADAPT demo domain (3 scenarios) |
 | `training/dataset.py` | GRPO dataset builder, ADAPT sample generator, output parsers |
+| `training/sft_schema.py` | Serialize teacher actions to strict JSON for SFT labels |
+| `training/build_sft_dataset.py` | Build JSONL chat data (AMAN/DMAN/ADAPT, bid + negotiate) |
+| `training/train_sft.py` | Unsloth + TRL SFTTrainer LoRA run on JSON completions |
 | `training/reward_functions.py` | Role-specific GRPO reward functions with COMA credit + `adapt_reward_fn` |
 | `training/train_grpo.py` | Multi-agent GRPO training entry point |
 | `training/eval.py` | Before/after training evaluation |
@@ -532,9 +546,20 @@ python multi_agent/inference.py --model "$MODEL_NAME" --all_tasks --episodes 1
 python training/train_grpo.py --episodes 200 --output_dir ./outputs/atc-grpo --run_eval
 ```
 
+### SFT on JSON outputs (before GRPO, optional)
+
+See **Training Stack → SFT cold-start** above. Quick commands:
+
+```bash
+python training/build_sft_dataset.py --out data/atc_sft.jsonl --episodes 500
+python training/train_sft.py --dataset data/atc_sft.jsonl --output_dir ./outputs/atc-sft-json
+```
+
 ### Colab Quick Start (T4 GPU, 4-bit QLoRA)
 
 Open `training/atc_multiagent_colab.ipynb` in Google Colab. Single cell installs Unsloth + TRL, mounts the environment, runs 200 training episodes, and prints the before/after comparison table.
+
+For **SFT (JSON) → GRPO** on medium-tier / negotiation-focused runs, use `training/atc_colab_sft_grpo_medium.ipynb` (Drive paths, optional SFT phase, then GRPO + eval + plots).
 
 ### Evaluate a Trained Checkpoint
 

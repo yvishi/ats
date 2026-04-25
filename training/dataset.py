@@ -23,8 +23,10 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import math
+
 from models import OperationType, SlotAssignment, TaskDefinition
-from tasks import task_catalog, ordered_tasks
+from tasks import task_catalog, ordered_tasks, tasks_up_to_tier, MAX_TASK_TIER
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
@@ -196,6 +198,38 @@ OUTPUT FORMAT (strict JSON, no markdown):
 
 
 
+# ── Heuristic action builders (used for negotiate-round conflict detection) ───
+
+def _heuristic_aman_action(task) -> "AMANAction":
+    """Naive arrival plan: each flight at scheduled_minute on its first runway."""
+    slots = []
+    for f in task.flights:
+        if f.operation == OperationType.ARRIVAL and f.allowed_runways:
+            minute = max(f.earliest_minute, min(f.latest_minute, f.scheduled_minute))
+            slots.append(SlotAssignment(
+                flight_id=f.flight_id,
+                runway=f.allowed_runways[0],
+                assigned_minute=minute,
+                hold_minutes=0,
+            ))
+    return AMANAction(arrival_slots=slots, rationale="heuristic")
+
+
+def _heuristic_dman_action(task) -> "DMANAction":
+    """Naive departure plan: each flight at scheduled_minute on its first runway."""
+    slots = []
+    for f in task.flights:
+        if f.operation == OperationType.DEPARTURE and f.allowed_runways:
+            minute = max(f.earliest_minute, min(f.latest_minute, f.scheduled_minute))
+            slots.append(SlotAssignment(
+                flight_id=f.flight_id,
+                runway=f.allowed_runways[0],
+                assigned_minute=minute,
+                hold_minutes=0,
+            ))
+    return DMANAction(departure_slots=slots, rationale="heuristic")
+
+
 # ── Dataset builder ───────────────────────────────────────────────────────────
 
 def build_episode_dataset(
@@ -216,7 +250,6 @@ def build_episode_dataset(
     import random
     rng = random.Random(seed)
     catalog = task_catalog()
-    task_list = list(ordered_tasks())
     supervisor = SupervisorAgent()
     env = MultiAgentATCEnvironment(seed=seed)
     generator = ChallengeGenerator(seed=seed)
@@ -237,10 +270,28 @@ def build_episode_dataset(
                 samples.append(_make_adapt_sample(ep_id, obs, dtask))
                 continue
 
+        # ── Competence-based task tier selection (Platanios 2019 √-schedule) ──
+        # progress ∈ [0, 1] across the dataset.  √-schedule spends more time at
+        # intermediate difficulty before advancing to the hardest tiers.
+        # Research basis: root schedule outperforms linear in competence-based
+        # curriculum (Platanios ACL 2019, VCRL arXiv 2509.19803).
+        progress  = ep_id / max(1, n_episodes - 1)          # 0.0 → 1.0
+        max_tier  = int(math.sqrt(progress) * MAX_TASK_TIER) # √-schedule: 0 → 4
+        max_tier  = max(0, min(MAX_TASK_TIER, max_tier))
 
-        base_task = rng.choice(task_list)
+        # Online rescue override: if generator EMA collapsed, force tier 0
+        if generator.is_in_rescue_mode():
+            max_tier = 0
 
-        profile = supervisor.sample_profile(ep_id)
+        # Pool = all tasks at or below the current competence ceiling
+        tier_pool = tasks_up_to_tier(max_tier)
+        base_task = rng.choice(tier_pool)
+
+        # Set mutation intensity to match the competence level directly —
+        # avoids the fake random-score update that distorted the EMA.
+        generator._difficulty_level = max(0, max_tier)
+
+        profile  = supervisor.sample_profile(ep_id)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
         # Apply generator mutation (rule-based for dataset generation)
@@ -254,12 +305,16 @@ def build_episode_dataset(
 
         atfm_json = json.dumps(env._state.atfm_deadlines)
 
+        # Track start index so tier annotation covers all samples for this
+        # episode regardless of how many negotiate samples are added below.
+        ep_start_idx = len(samples)
+
         # AMAN BID sample
         samples.append(_make_aman_sample(
             ep_id=ep_id,
             obs=aman_obs,
             atfm_json=atfm_json,
-            dman_slots_json="[]",  # no DMAN info yet at bid round
+            dman_slots_json="[]",
             sup_desc=sup_desc,
             profile=profile,
             round_name="bid",
@@ -270,13 +325,56 @@ def build_episode_dataset(
             ep_id=ep_id,
             obs=dman_obs,
             atfm_json=atfm_json,
-            aman_slots_json="[]",  # no AMAN info yet at bid round
+            aman_slots_json="[]",
             sup_desc=sup_desc,
             profile=profile,
             round_name="bid",
         ))
 
-        # Generator sample
+        # ── Negotiate-round samples ────────────────────────────────────────────
+        # Run a heuristic BID through the environment to detect conflicts, then
+        # build negotiate samples that teach agents to REDUCE those conflicts.
+        # The negotiate observation already contains the conflict_log so the
+        # model sees exactly which constraints it violated in the BID round.
+        try:
+            h_aman = _heuristic_aman_action(mutated_task)
+            h_dman = _heuristic_dman_action(mutated_task)
+            neg_aman_obs, neg_dman_obs, _, bid_done = env.step_bid(h_aman, h_dman)
+            if not bid_done:
+                # Count actual conflicts after the heuristic BID
+                from engine import simulate_plan as _sim_plan
+                bid_outcome = _sim_plan(
+                    mutated_task,
+                    env._state.aman_slots + env._state.dman_slots,
+                )
+                bid_n = bid_outcome.metrics.conflict_count
+                if bid_n > 0:
+                    h_dman_json = json.dumps([s.model_dump() for s in h_dman.departure_slots])
+                    h_aman_json = json.dumps([s.model_dump() for s in h_aman.arrival_slots])
+                    samples.append(_make_aman_sample(
+                        ep_id=ep_id,
+                        obs=neg_aman_obs,
+                        atfm_json=atfm_json,
+                        dman_slots_json=h_dman_json,
+                        sup_desc=sup_desc,
+                        profile=profile,
+                        round_name="negotiate",
+                        bid_conflict_count=bid_n,
+                    ))
+                    samples.append(_make_dman_sample(
+                        ep_id=ep_id,
+                        obs=neg_dman_obs,
+                        atfm_json=atfm_json,
+                        aman_slots_json=h_aman_json,
+                        sup_desc=sup_desc,
+                        profile=profile,
+                        round_name="negotiate",
+                        bid_conflict_count=bid_n,
+                    ))
+        except Exception:
+            pass  # Never break dataset building — negotiate samples are bonus signal
+
+        # Generator sample — carry the tier in metadata for logging
         if include_generator:
             samples.append(_make_generator_sample(
                 ep_id=ep_id,
@@ -286,7 +384,7 @@ def build_episode_dataset(
                 ema_score=generator.ema_score,
             ))
 
-        # Supervisor sample (uses a dummy merged plan for dataset; real plan used at inference)
+        # Supervisor sample
         if include_supervisor:
             samples.append(_make_supervisor_sample(
                 ep_id=ep_id,
@@ -295,8 +393,10 @@ def build_episode_dataset(
                 sup_desc=sup_desc,
             ))
 
-        # Simulate a mid-score episode to update generator curriculum
-        generator.update(rng.uniform(0.25, 0.75))
+        # Annotate all samples for this episode with the curriculum tier.
+        # Use ep_start_idx (not a fixed count) so negotiate samples are included.
+        for s in samples[ep_start_idx:]:
+            s["curriculum_tier"] = max_tier
 
     return samples
 
@@ -311,6 +411,7 @@ def _make_aman_sample(
     sup_desc: str,
     profile: SupervisorProfileName,
     round_name: str,
+    bid_conflict_count: int = 0,
 ) -> Dict[str, Any]:
     system = AMAN_SYSTEM + f"\n\nSUPERVISOR TODAY: {sup_desc}"
     user = obs.to_prompt_text()
@@ -319,13 +420,14 @@ def _make_aman_sample(
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
-        "task_id":            obs.task_id,
-        "agent_role":         AgentRole.AMAN.value,
-        "episode_id":         ep_id,
-        "round":              round_name,
-        "supervisor_profile": profile.value,
+        "task_id":             obs.task_id,
+        "agent_role":          AgentRole.AMAN.value,
+        "episode_id":          ep_id,
+        "round":               round_name,
+        "supervisor_profile":  profile.value,
         "atfm_deadlines_json": atfm_json,
-        "dman_slots_json":    dman_slots_json,
+        "dman_slots_json":     dman_slots_json,
+        "bid_conflict_count":  bid_conflict_count,
     }
 
 
@@ -337,6 +439,7 @@ def _make_dman_sample(
     sup_desc: str,
     profile: SupervisorProfileName,
     round_name: str,
+    bid_conflict_count: int = 0,
 ) -> Dict[str, Any]:
     system = DMAN_SYSTEM + f"\n\nSUPERVISOR TODAY: {sup_desc}"
     user = obs.to_prompt_text()
@@ -345,13 +448,14 @@ def _make_dman_sample(
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
-        "task_id":            obs.task_id,
-        "agent_role":         AgentRole.DMAN.value,
-        "episode_id":         ep_id,
-        "round":              round_name,
-        "supervisor_profile": profile.value,
+        "task_id":             obs.task_id,
+        "agent_role":          AgentRole.DMAN.value,
+        "episode_id":          ep_id,
+        "round":               round_name,
+        "supervisor_profile":  profile.value,
         "atfm_deadlines_json": atfm_json,
-        "aman_slots_json":    aman_slots_json,
+        "aman_slots_json":     aman_slots_json,
+        "bid_conflict_count":  bid_conflict_count,
     }
 
 

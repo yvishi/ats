@@ -79,6 +79,17 @@ except ImportError:
 MAX_NEGOTIATE_ROUNDS = 2   # max negotiation passes before forced merge
 ATFM_DEADLINE_HEADROOM = 8  # minutes of margin to call an ATFM violation
 
+
+def diagnostic_is_separation_issue(diagnostic_line: str) -> bool:
+    """True for wake/separation violations that force the negotiate round (matches _detect_conflicts)."""
+    d = diagnostic_line.lower()
+    return "spaced" in diagnostic_line or "conflict" in d
+
+
+def count_separation_issues(diagnostics: List[str]) -> int:
+    """Count separation / wake-spacing violations in simulator diagnostics."""
+    return sum(1 for line in diagnostics if diagnostic_is_separation_issue(line))
+
 # Domain randomization bounds — small perturbations to prevent task memorisation
 _RAND_WINDOW_DELTA  = 5    # ± minutes applied to flight windows
 _RAND_WEATHER_DELTA = 0.08  # ± weather_penalty (clipped to [1.0, 1.8])
@@ -322,7 +333,7 @@ class MultiAgentATCEnvironment:
         """Detect cross-agent runway conflicts by running simulate_plan on merge."""
         merged = state.aman_slots + state.dman_slots
         outcome = simulate_plan(state.task, merged)
-        conflicts = [d for d in outcome.diagnostics if "spaced" in d or "conflict" in d.lower()]
+        conflicts = [d for d in outcome.diagnostics if diagnostic_is_separation_issue(d)]
         return conflicts, outcome.diagnostics
 
     def _score_merged(self, state: EpisodeState) -> float:
@@ -506,11 +517,13 @@ class MultiAgentATCEnvironment:
         if cross_conflicts == 0:
             score += 0.25
 
-        # Negotiation efficiency
+        # Negotiation efficiency (extra pass penalised lightly vs unresolved conflicts)
         if state.negotiation_rounds == 0:
             score += 0.20
         elif state.negotiation_rounds == 1:
             score += 0.10
+        elif state.negotiation_rounds == 2:
+            score += 0.05
 
         # Emergency handling quality
         emergency_flights = [

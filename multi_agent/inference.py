@@ -7,6 +7,7 @@ Runs AMAN + DMAN agents against the ATC environment, either with:
 Output format mirrors inference.py structured logs:
   [START] task=... env=... model=...
   [STEP]  step=... role=AMAN|DMAN reward=... conflicts=... done=...
+    (conflicts = wake/separation issue count, not raw diagnostic list length)
   [NEG]   round=... conflicts_resolved=... messages=...
   [END]   task=... success=... composite=... aman=... dman=... coord=...
 
@@ -41,7 +42,11 @@ from models import (
 )
 from planner import build_heuristic_plan, build_refined_plan, _flight_sort_key
 from tasks import task_catalog, ordered_tasks
-from multi_agent.environment import MultiAgentATCEnvironment
+from multi_agent.environment import (
+    MAX_NEGOTIATE_ROUNDS,
+    MultiAgentATCEnvironment,
+    count_separation_issues,
+)
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
     AMANAction,
@@ -107,8 +112,15 @@ def log_end(
 
 # ── Heuristic AMAN planner ────────────────────────────────────────────────────
 
-def _build_aman_heuristic(obs: MultiAgentObservation) -> AMANAction:
-    """Deterministic arrival sequencer — priority-sorted, wake-turbulence aware."""
+def _build_aman_heuristic(
+    obs: MultiAgentObservation,
+    separation_repair: bool = False,
+) -> AMANAction:
+    """Deterministic arrival sequencer — priority-sorted, wake-turbulence aware.
+
+    When ``separation_repair`` is True (later negotiate passes), apply +1 minute
+    spacing slack and widen emergency-yield buffers to break residual tight pairs.
+    """
     arrivals = sorted(obs.my_flights, key=_flight_sort_key)
     runway_last: Dict[str, Tuple[int, str]] = {
         r.runway_id: (0, "M") for r in obs.all_runways
@@ -141,19 +153,21 @@ def _build_aman_heuristic(obs: MultiAgentObservation) -> AMANAction:
             wake_gap = SEPARATION_BY_WAKE.get(
                 (last_wake, flight.wake_class.value), 3
             )
-            min_gap = max(cap_gap, wake_gap)
+            min_gap = max(cap_gap, wake_gap) + (1 if separation_repair else 0)
             earliest = max(flight.earliest_minute, last_min + min_gap)
 
             if earliest > flight.latest_minute:
                 continue
 
-            # Avoid DMAN emergency slots (±3 min)
+            em_buf = 4 if separation_repair else 3
+            bump = 4 if separation_repair else 3
+            # Avoid DMAN emergency slots (±em_buf min)
             blocked = any(
-                rwy_id == er and abs(earliest - et) < 3
+                rwy_id == er and abs(earliest - et) < em_buf
                 for er, et in dman_emg_slots
             )
             if blocked:
-                earliest = min(flight.latest_minute, earliest + 3)
+                earliest = min(flight.latest_minute, earliest + bump)
                 if earliest > flight.latest_minute:
                     continue
                 emergency_yields.append(flight.flight_id)
@@ -203,7 +217,8 @@ def _build_aman_heuristic(obs: MultiAgentObservation) -> AMANAction:
     return AMANAction(
         arrival_slots=slots,
         rationale=f"Heuristic AMAN: {len(slots)}/{len(arrivals)} arrivals sequenced, "
-                  f"priority-sorted, wake-turbulence aware.",
+                  f"priority-sorted, wake-turbulence aware"
+                  f"{', separation-repair slack' if separation_repair else ''}.",
         emergency_yields=emergency_yields,
         outgoing_messages=messages,
         commit=False,
@@ -215,8 +230,13 @@ def _build_aman_heuristic(obs: MultiAgentObservation) -> AMANAction:
 def _build_dman_heuristic(
     obs: MultiAgentObservation,
     atfm_deadlines: Dict[str, int],
+    separation_repair: bool = False,
 ) -> DMANAction:
-    """Deterministic departure sequencer — ATFM-aware, emergency priority."""
+    """Deterministic departure sequencer — ATFM-aware, emergency priority.
+
+    When ``separation_repair`` is True, use +1 minute wake slack and ±4 min
+    AMAN-claim buffers to clear residual cross-lane spacing violations.
+    """
     from constants import SEPARATION_BY_WAKE
     from engine import _capacity_spacing
     from planner import PRIORITY_RANK
@@ -269,16 +289,17 @@ def _build_dman_heuristic(
             last_min, last_wake = runway_last.get(rwy_id, (0, "M"))
             cap_gap  = _capacity_spacing(rwy)
             wake_gap = SEPARATION_BY_WAKE.get((last_wake, flight.wake_class.value), 3)
-            min_gap  = max(cap_gap, wake_gap)
+            min_gap  = max(cap_gap, wake_gap) + (1 if separation_repair else 0)
             earliest = max(flight.earliest_minute, last_min + min_gap)
 
             if earliest > flight.latest_minute:
                 continue
 
-            # Avoid AMAN-claimed slots (±3 min) unless this is an emergency
+            claim_buf = 4 if separation_repair else 3
+            # Avoid AMAN-claimed slots (±claim_buf min) unless this is an emergency
             if not is_emg:
                 aman_mins = aman_claims.get(rwy_id, [])
-                while any(abs(earliest - am) < 3 for am in aman_mins):
+                while any(abs(earliest - am) < claim_buf for am in aman_mins):
                     earliest += 1
                 if earliest > flight.latest_minute:
                     continue
@@ -325,7 +346,8 @@ def _build_dman_heuristic(
     return DMANAction(
         departure_slots=slots,
         rationale=f"Heuristic DMAN: {len(slots)}/{len(departures)} departures sequenced, "
-                  f"ATFM-compliant, emergency-priority.",
+                  f"ATFM-compliant, emergency-priority"
+                  f"{', separation-repair slack' if separation_repair else ''}.",
         atfm_compliance=atfm_compliance,
         emergency_broadcasts=emergency_broadcasts,
         outgoing_messages=messages,
@@ -342,9 +364,11 @@ def _llm_action(
     obs: MultiAgentObservation,
     sup_desc: str,
     role: AgentRole,
+    temperature: Optional[float] = None,
 ) -> Optional[AMANAction | DMANAction]:
     if client is None:
         return None
+    temp = TEMPERATURE if temperature is None else temperature
     try:
         resp = client.chat.completions.create(
             model=model_name,
@@ -352,7 +376,7 @@ def _llm_action(
                 {"role": "system", "content": system + f"\n\nSUPERVISOR TODAY: {sup_desc}"},
                 {"role": "user",   "content": obs.to_prompt_text()},
             ],
-            temperature=TEMPERATURE,
+            temperature=temp,
             max_tokens=MAX_TOKENS,
         )
         text = (resp.choices[0].message.content or "").strip()
@@ -362,6 +386,91 @@ def _llm_action(
     except Exception as exc:
         _p(f"[WARN] LLM call failed ({role.value}): {exc} — falling back to heuristic")
         return None
+
+
+def _negotiate_multi_pass(
+    client,
+    selected_model: str,
+    sup_desc: str,
+    env: MultiAgentATCEnvironment,
+    aman_obs_start: MultiAgentObservation,
+    dman_obs_start: MultiAgentObservation,
+    atfm: Dict[str, int],
+    rounds: List[Dict[str, Any]],
+) -> Tuple[MultiAgentObservation, MultiAgentObservation]:
+    """Up to MAX_NEGOTIATE_ROUNDS revision passes on separation conflicts.
+
+    Pass 1 uses the LLM when ``client`` is set (lower temperature for stability);
+    subsequent passes use heuristics only to recover when the LLM worsens spacing.
+    """
+    aman_cur, dman_cur = aman_obs_start, dman_obs_start
+    max_passes = MAX_NEGOTIATE_ROUNDS if client is not None else 1
+
+    for neg_r in range(1, max_passes + 1):
+        sep_before = count_separation_issues(env._state.conflict_log)
+        if sep_before == 0:
+            break
+
+        use_llm = client is not None and neg_r == 1
+        if use_llm:
+            aman_action = (
+                _llm_action(
+                    client,
+                    selected_model,
+                    AMAN_SYSTEM,
+                    aman_cur,
+                    sup_desc,
+                    AgentRole.AMAN,
+                    temperature=0.2,
+                )
+                or _build_aman_heuristic(aman_cur)
+            )
+            dman_action = (
+                _llm_action(
+                    client,
+                    selected_model,
+                    DMAN_SYSTEM,
+                    dman_cur,
+                    sup_desc,
+                    AgentRole.DMAN,
+                    temperature=0.2,
+                )
+                or _build_dman_heuristic(dman_cur, atfm)
+            )
+        else:
+            repair = neg_r >= 2
+            aman_action = _build_aman_heuristic(aman_cur, separation_repair=repair)
+            dman_action = _build_dman_heuristic(dman_cur, atfm, separation_repair=repair)
+
+        aman_cur, dman_cur, partial_r, _ = env.step_negotiate(aman_action, dman_action)
+        sep_after = count_separation_issues(env._state.conflict_log)
+        resolved = max(0, sep_before - sep_after)
+        total_msgs = len(aman_action.outgoing_messages) + len(dman_action.outgoing_messages)
+        log_neg(neg_r, resolved, total_msgs)
+        log_step(1 + neg_r, "NEGOTIATE", partial_r, sep_after, True)
+
+        rounds.append({
+            "round": "NEGOTIATE",
+            "negotiate_pass": neg_r,
+            "partial_reward": partial_r,
+            "separation_issues_before": sep_before,
+            "separation_issues_after": sep_after,
+            "diagnostics_count": len(env._state.conflict_log),
+            "conflicts_resolved": resolved,
+            "total_messages": total_msgs,
+            "aman_alternatives_offered": sum(
+                len(m.proposed_alternatives) for m in aman_action.outgoing_messages
+            ),
+            "dman_alternatives_offered": sum(
+                len(m.proposed_alternatives) for m in dman_action.outgoing_messages
+            ),
+            "used_llm": use_llm,
+        })
+
+        if sep_after == 0:
+            break
+
+    return aman_cur, dman_cur
 
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
@@ -441,13 +550,15 @@ def run_episode(
     )
 
     aman_obs2, dman_obs2, partial_r, done = env.step_bid(aman_action, dman_action)
-    n_conflicts_before = len(env._state.conflict_log)
-    log_step(1, "BID", partial_r, n_conflicts_before, done)
+    n_sep_after_bid = count_separation_issues(env._state.conflict_log)
+    n_diag_after_bid = len(env._state.conflict_log)
+    log_step(1, "BID", partial_r, n_sep_after_bid, done)
 
     rounds.append({
         "round": "BID",
         "partial_reward": partial_r,
-        "conflicts_detected": n_conflicts_before,
+        "separation_issues_detected": n_sep_after_bid,
+        "diagnostics_count": n_diag_after_bid,
         "aman_slots": len(aman_action.arrival_slots),
         "dman_slots": len(dman_action.departure_slots),
         "aman_messages": len(aman_action.outgoing_messages),
@@ -455,37 +566,18 @@ def run_episode(
         "done": done,
     })
 
-    # ── Round 1: NEGOTIATE (if conflicts) ─────────────────────────────────────
+    # ── Negotiate: LLM first (if available), then heuristic-only repair passes ─
     if not done:
-        aman_action2 = (
-            _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs2, sup_desc, AgentRole.AMAN)
-            or _build_aman_heuristic(aman_obs2)
+        _negotiate_multi_pass(
+            client,
+            selected_model,
+            sup_desc,
+            env,
+            aman_obs2,
+            dman_obs2,
+            atfm,
+            rounds,
         )
-        dman_action2 = (
-            _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs2, sup_desc, AgentRole.DMAN)
-            or _build_dman_heuristic(dman_obs2, atfm)
-        )
-        aman_obs3, dman_obs3, partial_r2, _ = env.step_negotiate(aman_action2, dman_action2)
-        n_conflicts_after = len(env._state.conflict_log)
-        resolved = max(0, n_conflicts_before - n_conflicts_after)
-        total_msgs = len(aman_action2.outgoing_messages) + len(dman_action2.outgoing_messages)
-        log_neg(1, resolved, total_msgs)
-        log_step(2, "NEGOTIATE", partial_r2, n_conflicts_after, True)
-
-        rounds.append({
-            "round": "NEGOTIATE",
-            "partial_reward": partial_r2,
-            "conflicts_before": n_conflicts_before,
-            "conflicts_after": n_conflicts_after,
-            "conflicts_resolved": resolved,
-            "total_messages": total_msgs,
-            "aman_alternatives_offered": sum(
-                len(m.proposed_alternatives) for m in aman_action2.outgoing_messages
-            ),
-            "dman_alternatives_offered": sum(
-                len(m.proposed_alternatives) for m in dman_action2.outgoing_messages
-            ),
-        })
 
     # ── Finalize ──────────────────────────────────────────────────────────────
     result = env.finalize()
@@ -555,7 +647,7 @@ def run_domain_episode(
     Args:
         domain_task_id: Key from the domains registry, e.g. 'icu_mass_casualty'.
     """
-    from domains import get_all_domain_tasks, get_domain_description
+    from domains import get_all_domain_tasks
     from multi_agent.adapt import (
         build_adapt_observation,
         _build_adapt_heuristic,
@@ -574,6 +666,7 @@ def run_domain_episode(
     domain_task = all_domain_tasks[domain_task_id]
     profile     = supervisor.sample_profile(episode_id)
     sup_desc    = SUPERVISOR_PROFILES[profile]["description"]
+    rounds: List[Dict[str, Any]] = []
 
     # ── ADAPT step ────────────────────────────────────────────────────────────
     adapt_obs = build_adapt_observation(task=domain_task, profile=profile)
@@ -617,43 +710,87 @@ def run_domain_episode(
         mutated_task=mapped_task,
     )
     atfm = env._state.atfm_deadlines
+    selected_model = model_name or MODEL_NAME
 
     aman_action = _build_aman_heuristic(aman_obs)
     dman_action = _build_dman_heuristic(dman_obs, atfm)
     if client is not None:
         aman_action = (
-            _llm_action(client, model_name or MODEL_NAME, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
+            _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
             or aman_action
         )
         dman_action = (
-            _llm_action(client, model_name or MODEL_NAME, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
+            _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
             or dman_action
         )
 
     aman_obs2, dman_obs2, partial_r, done = env.step_bid(aman_action, dman_action)
-    log_step(1, "BID", partial_r, len(env._state.conflict_log), done)
+    n_sep_after_bid = count_separation_issues(env._state.conflict_log)
+    n_diag_after_bid = len(env._state.conflict_log)
+    log_step(1, "BID", partial_r, n_sep_after_bid, done)
+
+    rounds.append({
+        "round": "BID",
+        "partial_reward": partial_r,
+        "separation_issues_detected": n_sep_after_bid,
+        "diagnostics_count": n_diag_after_bid,
+        "aman_slots": len(aman_action.arrival_slots),
+        "dman_slots": len(dman_action.departure_slots),
+        "aman_messages": len(aman_action.outgoing_messages),
+        "dman_messages": len(dman_action.outgoing_messages),
+        "done": done,
+    })
 
     if not done:
-        aman_action2 = _build_aman_heuristic(aman_obs2)
-        dman_action2 = _build_dman_heuristic(dman_obs2, atfm)
-        _, _, partial_r2, _ = env.step_negotiate(aman_action2, dman_action2)
-        resolved = max(0, len(env._state.conflict_log))
-        log_neg(1, resolved, 0)
-        log_step(2, "NEGOTIATE", partial_r2, 0, True)
+        _negotiate_multi_pass(
+            client,
+            selected_model,
+            sup_desc,
+            env,
+            aman_obs2,
+            dman_obs2,
+            atfm,
+            rounds,
+        )
 
     result = env.finalize()
 
-    episode_result = {
+    episode_result: Dict[str, Any] = {
         "domain_task_id":  domain_task_id,
         "composite":       result.composite_score,
         "aman_reward":     result.aman_reward,
         "dman_reward":     result.dman_reward,
         "coord_score":     result.per_role.coordination_score,
         "conflicts":       result.per_role.cross_lane_conflicts,
+        "neg_rounds":      result.negotiation_rounds,
         "supervisor":      profile.value,
         "adapt_wake_map":  adapt_action.entity_wake_map,
         "adapt_priority_map": adapt_action.entity_priority_map,
     }
+
+    if transcript_dir is not None:
+        _save_transcript(
+            transcript_dir,
+            episode_id,
+            {
+                "episode_id":         episode_id,
+                "domain_task_id":     domain_task_id,
+                "mode":               "adapt_domain_transfer",
+                "supervisor_profile": profile.value,
+                "adapt_wake_map":     adapt_action.entity_wake_map,
+                "adapt_priority_map": adapt_action.entity_priority_map,
+                "adapt_rationale":    adapt_rationale,
+                "rounds":             rounds,
+                "final": {
+                    "composite_score":    result.composite_score,
+                    "aman_reward":        result.aman_reward,
+                    "dman_reward":        result.dman_reward,
+                    "coordination_score": result.per_role.coordination_score,
+                    "cross_lane_conflicts": result.per_role.cross_lane_conflicts,
+                    "negotiation_rounds": result.negotiation_rounds,
+                },
+            },
+        )
 
     _p(
         f"[END]   domain={domain_task_id} success={str(result.composite_score >= SUCCESS_THRESHOLD).lower()} "

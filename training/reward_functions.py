@@ -26,7 +26,7 @@ try:
         parse_dman_action,
         parse_generator_action,
     )
-    from ..models import OperationType, PriorityClass, SlotAssignment, TaskDefinition
+    from ..models import OperationType, PriorityClass, SlotAssignment, TaskDefinition, WakeClass
     from ..tasks import task_catalog
     from ..multi_agent.generator import ChallengeGenerator
     from ..multi_agent.models import SupervisorProfileName
@@ -42,7 +42,7 @@ except ImportError:
         parse_dman_action,
         parse_generator_action,
     )
-    from models import OperationType, PriorityClass, SlotAssignment, TaskDefinition
+    from models import OperationType, PriorityClass, SlotAssignment, TaskDefinition, WakeClass
     from tasks import task_catalog
     from multi_agent.generator import ChallengeGenerator
     from multi_agent.models import SupervisorProfileName
@@ -59,6 +59,77 @@ _ROLE_TOKEN_BUDGETS = {
     "GENERATOR": int(os.getenv("ATC_ROLE_TOKENS_GENERATOR", "224")),
     "SUPERVISOR": int(os.getenv("ATC_ROLE_TOKENS_SUPERVISOR", "160")),
 }
+
+# Wake turbulence minimum separation (minutes), keyed by (leading_class, trailing_class).
+# Source: AMAN system prompt rules + ICAO Doc 4444 wake separation table.
+_WAKE_MIN_SEP: Dict[tuple, int] = {
+    ("H", "H"): 4, ("H", "M"): 5, ("H", "L"): 6,
+    ("M", "H"): 3, ("M", "M"): 3, ("M", "L"): 3,
+    ("L", "H"): 3, ("L", "M"): 3, ("L", "L"): 3,
+}
+
+
+def _wake_separation_penalty(slots: List[SlotAssignment], task: TaskDefinition) -> float:
+    """Penalise slots that violate wake turbulence separation on a shared runway.
+
+    Checks every consecutive same-runway pair (sorted by assigned_minute).
+    Returns a value in [0.0, 0.40]: 0 = no violations, 0.40 = all pairs violated.
+
+    Applies to both arrivals (AMAN) and departures (DMAN) — wake vortex affects
+    both approach and departure sequences when sharing a runway.
+    """
+    flights_by_id = {f.flight_id: f for f in task.flights}
+    runway_slots: Dict[str, List[SlotAssignment]] = {}
+    for slot in slots:
+        if slot.flight_id in flights_by_id:
+            runway_slots.setdefault(slot.runway, []).append(slot)
+
+    violations = 0
+    total_pairs = 0
+    for rwy_slots in runway_slots.values():
+        sorted_slots = sorted(rwy_slots, key=lambda s: s.assigned_minute)
+        for i in range(len(sorted_slots) - 1):
+            lslot = sorted_slots[i]
+            tslot = sorted_slots[i + 1]
+            lf = flights_by_id.get(lslot.flight_id)
+            tf = flights_by_id.get(tslot.flight_id)
+            if lf is None or tf is None:
+                continue
+            gap = tslot.assigned_minute - lslot.assigned_minute
+            min_sep = _WAKE_MIN_SEP.get(
+                (lf.wake_class.value, tf.wake_class.value), 3
+            )
+            total_pairs += 1
+            if gap < min_sep:
+                violations += 1
+
+    if total_pairs == 0:
+        return 0.0
+    return round(min(0.40, 0.40 * violations / total_pairs), 4)
+
+
+def _delta_conflict_bonus(
+    new_slots: List[SlotAssignment],
+    other_slots: List[SlotAssignment],
+    task: TaskDefinition,
+    bid_conflict_count: int,
+) -> float:
+    """Immediate reward for reducing conflicts during the negotiate round.
+
+    Positive = conflicts reduced (good negotiation), negative = conflicts increased.
+    Range: [-0.30, +0.30]. Zero when bid_conflict_count == 0 (no conflicts to fix).
+
+    This is the key fix for the Pune failure: agents that make things WORSE during
+    negotiation now receive a negative signal at that step, not just a delayed penalty.
+    """
+    if bid_conflict_count <= 0:
+        return 0.0
+    merged = new_slots + other_slots
+    outcome = simulate_plan(task, merged)
+    new_conflicts = outcome.metrics.conflict_count
+    delta = bid_conflict_count - new_conflicts  # positive = improved
+    normalized = delta / max(1, bid_conflict_count)
+    return round(max(-0.30, min(0.30, 0.30 * normalized)), 4)
 
 
 def _debug_reward_trace(role: str, components: Dict[str, float]) -> None:
@@ -201,9 +272,12 @@ def aman_reward_fn(
         n,
         "{}",
     )
+    round_names = _metadata_list(kwargs.get("round"), n, "bid")
+    bid_conflict_counts = _metadata_list(kwargs.get("bid_conflict_count"), n, 0)
 
-    for completion, tid, profile_str, dman_json, _atfm_json in zip(
-        completions, task_id, supervisor_profile, dman_slots_json, atfm_deadlines_json
+    for completion, tid, profile_str, dman_json, _atfm_json, round_name, bid_n in zip(
+        completions, task_id, supervisor_profile, dman_slots_json, atfm_deadlines_json,
+        round_names, bid_conflict_counts,
     ):
         task = catalog.get(tid)
         if task is None:
@@ -305,6 +379,18 @@ def aman_reward_fn(
         coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
         reward -= conflict_penalty + emg_penalty + coverage_penalty
 
+        # Wake turbulence separation — immediate signal for H/M/L ordering violations.
+        wake_penalty = _wake_separation_penalty(aman_action.arrival_slots, task)
+        reward -= wake_penalty
+
+        # Negotiate-round delta bonus — reward/penalise conflict CHANGE vs bid round.
+        delta_bonus = 0.0
+        if round_name == "negotiate" and bid_n:
+            delta_bonus = _delta_conflict_bonus(
+                aman_action.arrival_slots, dman_slots, task, int(bid_n)
+            )
+            reward += delta_bonus
+
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
             role="AMAN",
@@ -324,6 +410,8 @@ def aman_reward_fn(
                 "conflict_penalty": -conflict_penalty,
                 "emg_penalty": -emg_penalty,
                 "coverage_penalty": -coverage_penalty,
+                "wake_penalty": -wake_penalty,
+                "delta_bonus": delta_bonus,
                 "final_reward": reward,
             },
         )
@@ -361,9 +449,12 @@ def dman_reward_fn(
         n,
         "{}",
     )
+    round_names = _metadata_list(kwargs.get("round"), n, "bid")
+    bid_conflict_counts = _metadata_list(kwargs.get("bid_conflict_count"), n, 0)
 
-    for completion, tid, profile_str, aman_json, atfm_json in zip(
-        completions, task_id, supervisor_profile, aman_slots_json, atfm_deadlines_json
+    for completion, tid, profile_str, aman_json, atfm_json, round_name, bid_n in zip(
+        completions, task_id, supervisor_profile, aman_slots_json, atfm_deadlines_json,
+        round_names, bid_conflict_counts,
     ):
         task = catalog.get(tid)
         if task is None:
@@ -473,6 +564,18 @@ def dman_reward_fn(
         coverage_penalty = max(0.0, 0.55 - coverage) * 0.9
         reward -= conflict_penalty + emg_penalty + coverage_penalty
 
+        # Wake turbulence separation — immediate signal for H/M/L ordering violations.
+        wake_penalty = _wake_separation_penalty(dman_action.departure_slots, task)
+        reward -= wake_penalty
+
+        # Negotiate-round delta bonus — reward/penalise conflict CHANGE vs bid round.
+        delta_bonus = 0.0
+        if round_name == "negotiate" and bid_n:
+            delta_bonus = _delta_conflict_bonus(
+                dman_action.departure_slots, aman_slots, task, int(bid_n)
+            )
+            reward += delta_bonus
+
         reward = round(max(-1.0, min(1.0, reward)), 4)
         _debug_reward_trace(
             role="DMAN",
@@ -493,6 +596,8 @@ def dman_reward_fn(
                 "conflict_penalty": -conflict_penalty,
                 "emg_penalty": -emg_penalty,
                 "coverage_penalty": -coverage_penalty,
+                "wake_penalty": -wake_penalty,
+                "delta_bonus": delta_bonus,
                 "final_reward": reward,
             },
         )
@@ -970,8 +1075,4 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
     return rewards
 
 
-def _debug_reward_trace(role: str, metrics: Dict[str, float]) -> None:
-    """Optional trace log for reward components during local debugging."""
-    if os.getenv("ATC_REWARD_TRACE") == "1":
-        print(f"[TRACE] role={role} " + " ".join(f"{k}={v:.3f}" for k, v in metrics.items()))
 

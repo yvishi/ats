@@ -20,6 +20,9 @@ Colab T4 resource profile:
   Max tokens:   512 per completion
   Training:     ~200 episodes ≈ 800 samples ≈ 2 hr on T4
 
+For JSON parse reliability on a cold base model, run SFT first (``training/build_sft_dataset.py`` +
+``training/train_sft.py``) then continue from the saved adapter.
+
 Usage:
   python training/train_grpo.py [--episodes 200] [--model Qwen/Qwen2.5-7B-Instruct]
 
@@ -111,9 +114,16 @@ ROLE_MAX_NEW_TOKENS = {
     AgentRole.GENERATOR.value: 224,
     AgentRole.SUPERVISOR.value: 160,
 }
-# 4 generations per prompt: minimum group size for a stable GRPO advantage estimate.
-# With N=2 the group std is near-zero, making the normalised advantage meaningless.
-N_GENERATIONS  = 4
+# 8 generations per prompt.
+# Research basis (GRPO dynamics, arXiv 2503.06639): the adaptive advantage weight
+# w_i = (1-p)/√[p(1-p)] relies on an accurate estimate of p (per-prompt success
+# rate).  With N=4 the estimate variance is high enough to produce misleading
+# advantage signs on low-success prompts.  N=8 halves the estimation variance
+# while keeping VRAM cost manageable on T4 (1.5B model, LoRA rank 16).
+# DAPO / NGRPO finding: groups where pass@N ∈ {0, N} have std≈0 → zero GRPO
+# gradient.  Larger N reduces the probability of all-correct or all-wrong groups
+# on intermediate-difficulty tasks.
+N_GENERATIONS  = 8
 BATCH_SIZE     = 4
 GRAD_ACCUM     = 2           # effective batch = 8
 LR             = 5e-5
@@ -774,6 +784,11 @@ def train(
     # ── 5. Per-role reward logger ─────────────────────────────────────────────
     print("\n[4/5] Setting up per-role reward logging...")
 
+    # Curriculum generator: receives real GRPO group rewards so the adaptive
+    # curriculum can trigger rescue mode and tier changes based on actual training
+    # performance rather than the simulated scores used during dataset building.
+    curriculum_generator = ChallengeGenerator(seed=seed)
+
     # Separate lists so we can show per-role curves in the demo
     reward_log: Dict[str, List[float]] = {
         "AMAN": [], "DMAN": [], "GENERATOR": [], "SUPERVISOR": [], "composite": []
@@ -792,6 +807,8 @@ def train(
         "AMAN": 0, "DMAN": 0, "GENERATOR": 0, "SUPERVISOR": 0
     }
     reward_call_count = 0
+    # Per-tier reward accumulator for ZPD logging
+    tier_reward_log: Dict[int, List[float]] = {i: [] for i in range(5)}
 
     class RewardLogger:
         __name__ = "combined_reward_fn"
@@ -823,6 +840,43 @@ def train(
 
             rewards = combined_reward_fn(completions, **kwargs)
             reward_call_count += 1
+
+            # ── Degenerate-group detection + live curriculum update ────────────
+            # When all N_GENERATIONS completions in a group have near-identical
+            # rewards, std(group) ≈ 0 and GRPO produces zero gradient.
+            # Two common causes:
+            #   (a) All-wrong: task too hard — every completion parse-fails.
+            #   (b) All-right: task too easy — every completion is correct.
+            # We pass real group rewards into the curriculum generator so it can
+            # trigger rescue mode (all-wrong) or advance tier (all-right) based
+            # on actual training performance, not the simulated scores used during
+            # dataset building.  (Research: VCRL arXiv 2509.19803, DAPO 2025)
+            if len(rewards) >= 2:
+                import statistics as _stats
+                try:
+                    grp_std = _stats.stdev(rewards)
+                except _stats.StatisticsError:
+                    grp_std = 0.0
+                grp_mean = sum(rewards) / len(rewards)
+                # Feed every group into the curriculum generator (not just degenerate ones)
+                curriculum_generator.update(grp_mean, rewards)
+                if grp_std < 0.01:
+                    mode_tag = "ALL-WRONG" if grp_mean < -0.3 else "ALL-CORRECT"
+                    if reward_call_count % 20 == 0:
+                        print(
+                            f"[ZPD_WARN] {mode_tag} group detected "
+                            f"(std={grp_std:.4f}, mean={grp_mean:.3f}) "
+                            f"at call={reward_call_count}.  "
+                            f"{curriculum_generator.curriculum_summary()}"
+                        )
+
+            # ── Per-tier reward accumulation ──────────────────────────────────
+            tier = kwargs.get("curriculum_tier", [curriculum_generator.current_tier] * len(rewards))
+            if not isinstance(tier, list):
+                tier = [tier] * len(rewards)
+            for r, t in zip(rewards, tier):
+                t_int = int(t) if isinstance(t, (int, float)) else curriculum_generator.current_tier
+                tier_reward_log[t_int].append(r)
 
             roles = kwargs.get("agent_role", [])
             if not isinstance(roles, list):
@@ -1113,6 +1167,31 @@ def train(
     curves_path = Path(output_dir) / "reward_curves.json"
     _save_json(reward_log, curves_path)
     print(f"Reward curves -> {curves_path}")
+
+    # Save per-tier reward summary and curriculum state
+    tier_summary = {
+        str(tier): {
+            "n_samples": len(rws),
+            "mean":      round(sum(rws) / len(rws), 4) if rws else None,
+            "first_q":   round(sum(rws[:max(1, len(rws)//4)]) / max(1, len(rws)//4), 4) if rws else None,
+            "last_q":    round(sum(rws[max(0,3*len(rws)//4):]) / max(1, len(rws)-3*len(rws)//4), 4) if rws else None,
+        }
+        for tier, rws in tier_reward_log.items()
+    }
+    tier_curves_path = Path(output_dir) / "tier_reward_summary.json"
+    _save_json(tier_summary, tier_curves_path)
+
+    curriculum_report = curriculum_generator.mastery_report()
+    _save_json(curriculum_report, Path(output_dir) / "curriculum_state.json")
+
+    print("\n── Curriculum Summary ──────────────────────────────────────")
+    print(curriculum_generator.curriculum_summary())
+    print("Per-tier mean rewards:")
+    for tier, stats in tier_summary.items():
+        if stats["n_samples"] > 0:
+            print(f"  Tier {tier}: n={stats['n_samples']}  mean={stats['mean']}  "
+                  f"first_q={stats['first_q']}  last_q={stats['last_q']}")
+    print("────────────────────────────────────────────────────────────\n")
 
     _print_final_stats(reward_log)
 

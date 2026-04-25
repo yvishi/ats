@@ -31,7 +31,7 @@ try:
 except ImportError:
     _OPENENV_AVAILABLE = False
 
-from multi_agent.environment import MultiAgentATCEnvironment
+from multi_agent.environment import MAX_NEGOTIATE_ROUNDS, MultiAgentATCEnvironment, count_separation_issues
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.supervisor import SupervisorAgent
 from tasks import ordered_tasks
@@ -151,10 +151,22 @@ class ATCEnvironment(_EnvBase):
                 done=False,
             )
 
-        # negotiate → always terminates the episode
+        # negotiate → apply client revision, then optional heuristic-only repair passes
         aman_obs, dman_obs, partial_reward, _ = self._env.step_negotiate(
             aman_action, dman_action
         )
+        if count_separation_issues(self._env._state.conflict_log) > 0:
+            from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+
+            atfm = self._env._state.atfm_deadlines
+            for _ in range(1, MAX_NEGOTIATE_ROUNDS):
+                if count_separation_issues(self._env._state.conflict_log) == 0:
+                    break
+                aman_h = _build_aman_heuristic(aman_obs, separation_repair=True)
+                dman_h = _build_dman_heuristic(dman_obs, atfm, separation_repair=True)
+                aman_obs, dman_obs, partial_reward, _ = self._env.step_negotiate(
+                    aman_h, dman_h
+                )
         return self._finalize(partial_reward)
 
     @property

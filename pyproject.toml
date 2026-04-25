@@ -43,6 +43,8 @@ training-unsloth = [
 [project.scripts]
 server = "atc_env.server.app:main"
 atc-train = "training.train_grpo:main"
+atc-train-sft = "training.train_sft:main"
+atc-build-sft-data = "training.build_sft_dataset:main"
 atc-eval = "training.eval:main"
 atc-plot = "training.plot_rewards:main"
 
