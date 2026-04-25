@@ -6,8 +6,23 @@ import json
 from enum import Enum
 from typing import Dict, List, Literal
 
-from openenv.core.env_server.types import Action, Observation, State
 from pydantic import BaseModel, Field, field_validator
+
+try:
+    from openenv.core.env_server.types import Action, Observation, State
+except Exception as exc:
+    # Fallback for training-only workflows when OpenEnv runtime deps are partially
+    # installed (for example fastmcp/openenv version skew on cluster nodes).
+    print(f"[WARN] OpenEnv types unavailable, using local BaseModel fallbacks: {exc}")
+
+    class Action(BaseModel):
+        pass
+
+    class Observation(BaseModel):
+        pass
+
+    class State(BaseModel):
+        pass
 
 
 class OperationType(str, Enum):
