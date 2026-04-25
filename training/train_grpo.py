@@ -477,8 +477,11 @@ def train(
         seed=seed,
         include_generator=True,
         include_supervisor=True,
+        include_adapt=True,
+        domain_episode_ratio=0.30,
     )
     print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
+
 
     role_counts: Dict[str, int] = {}
     for s in dataset_raw:

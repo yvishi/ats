@@ -779,3 +779,141 @@ def _extract_supervisor_score(completion: Any) -> Optional[float]:
         if match:
             return float(match.group(1))
     return None
+
+
+# ── ADAPT reward function ─────────────────────────────────────────────────────
+
+def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
+    """Reward ADAPT meta-agent for quality of structural domain transfer.
+
+    Signal = downstream operational efficiency on the ADAPT-mapped task
+             compared to the heuristic baseline on the *unmapped* task.
+
+    Components (summed, clamped to [-1, 1]):
+      0.70 × downstream_composite   — how well AMAN+DMAN solve the mapped task
+      0.15 × improvement_over_base  — delta vs running heuristic on raw task
+      0.10 × mapping_coverage       — fraction of entity types that were mapped
+      up to 0.05 × rationale_bonus  — rationale ≥ 30 chars citing numbers
+
+    Parse failure → -0.50 immediately.
+    Missing domain_task_json → -0.60 immediately.
+    """
+    from multi_agent.adapt import (
+        _build_adapt_heuristic,
+        apply_adapt_mapping,
+        build_adapt_observation,
+        parse_adapt_action,
+        _compute_entity_profiles,
+    )
+
+    rewards: List[float] = []
+    n = len(completions)
+
+    task_ids            = kwargs.get("task_id",            [None] * n)
+    domain_task_jsons   = kwargs.get("domain_task_json",   [None] * n)
+    supervisor_profiles = kwargs.get("supervisor_profile", [None] * n)
+
+    if not isinstance(task_ids, list):            task_ids            = [task_ids]            * n
+    if not isinstance(domain_task_jsons, list):   domain_task_jsons   = [domain_task_jsons]   * n
+    if not isinstance(supervisor_profiles, list): supervisor_profiles = [supervisor_profiles] * n
+
+    for i, completion in enumerate(completions):
+        dtjson  = domain_task_jsons[i]   if i < len(domain_task_jsons)   else None
+        profile = supervisor_profiles[i] if i < len(supervisor_profiles) else None
+
+        # ── Guard: missing domain task ────────────────────────────────────────
+        if not dtjson:
+            rewards.append(-0.60)
+            continue
+
+        try:
+            domain_task = TaskDefinition.model_validate_json(dtjson)
+        except Exception:
+            rewards.append(-0.60)
+            continue
+
+        # ── Guard: parse failure ──────────────────────────────────────────────
+        action = parse_adapt_action(completion)
+        if action is None:
+            rewards.append(-0.50)
+            continue
+
+        # ── Resolve supervisor profile ────────────────────────────────────────
+        try:
+            prof_enum = SupervisorProfileName(profile) if profile else SupervisorProfileName.SAFETY_STRICT
+        except ValueError:
+            prof_enum = SupervisorProfileName.SAFETY_STRICT
+
+        # ── Build observation for heuristic baseline ──────────────────────────
+        try:
+            adapt_obs = build_adapt_observation(
+                task=domain_task,
+                profile=prof_enum,
+            )
+        except Exception:
+            rewards.append(-0.40)
+            continue
+
+        # ── Baseline: heuristic ADAPT on unmapped task ────────────────────────
+        try:
+            heuristic_action   = _build_adapt_heuristic(adapt_obs, domain_task)
+            heuristic_mapped   = apply_adapt_mapping(domain_task, heuristic_action)
+            env_base           = MultiAgentATCEnvironment(seed=0)
+            env_base.reset(episode_id=0, supervisor_profile=prof_enum, mutated_task=heuristic_mapped)
+            from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+            aman_obs_b, dman_obs_b = env_base.reset(0, prof_enum, heuristic_mapped)
+            aman_act_b = _build_aman_heuristic(aman_obs_b)
+            dman_act_b = _build_dman_heuristic(dman_obs_b, env_base._state.atfm_deadlines)
+            env_base.step_bid(aman_act_b, dman_act_b)
+            baseline_result    = env_base.finalize()
+            baseline_composite = baseline_result.composite_score
+        except Exception:
+            baseline_composite = 0.40  # fallback if heuristic run fails
+
+        # ── Downstream: LLM ADAPT action on its mapped task ──────────────────
+        try:
+            llm_mapped  = apply_adapt_mapping(domain_task, action)
+            env_llm     = MultiAgentATCEnvironment(seed=0)
+            aman_obs_l, dman_obs_l = env_llm.reset(0, prof_enum, llm_mapped)
+            aman_act_l  = _build_aman_heuristic(aman_obs_l)
+            dman_act_l  = _build_dman_heuristic(dman_obs_l, env_llm._state.atfm_deadlines)
+            env_llm.step_bid(aman_act_l, dman_act_l)
+            llm_result  = env_llm.finalize()
+            downstream  = llm_result.composite_score
+        except Exception:
+            downstream = 0.0
+
+        # ── Coverage: what fraction of entity types were mapped? ──────────────
+        entity_types = set(adapt_obs.entity_types)
+        mapped_types = set(action.entity_wake_map.keys()) | set(action.entity_priority_map.keys())
+        coverage = len(entity_types & mapped_types) / max(1, len(entity_types))
+
+        # ── Rationale bonus: cite numbers? ────────────────────────────────────
+        rationale = action.rationale or ""
+        import re as _re
+        has_numbers = bool(_re.search(r"\d+\.\d+", rationale))
+        rationale_bonus = 0.05 if (len(rationale) >= 30 and has_numbers) else 0.0
+
+        # ── Compose reward ────────────────────────────────────────────────────
+        improvement = downstream - baseline_composite          # positive = LLM beat heuristic
+        reward = (
+            0.70 * downstream
+            + 0.15 * max(-1.0, min(1.0, improvement))
+            + 0.10 * coverage
+            + rationale_bonus
+        )
+        reward = max(-1.0, min(1.0, reward))
+
+        _debug_reward_trace("ADAPT", {
+            "downstream_composite": downstream,
+            "baseline_composite":   baseline_composite,
+            "improvement":          improvement,
+            "coverage":             coverage,
+            "rationale_bonus":      rationale_bonus,
+            "total_reward":         reward,
+        })
+
+        rewards.append(reward)
+
+    return rewards
+
