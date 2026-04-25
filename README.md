@@ -104,58 +104,52 @@ Random agents score below 0.22 even on the easy task — the 3-layer gated grade
 
 ## Architecture
 
-### Single-Agent
-
 ```mermaid
-graph LR
-    A[Single Agent] -->|ATCOptimizationAction| B[OpenEnv step API]
-    B --> C[ATCOptimizationEnvironment]
-    C --> D[Simulation Engine]
-    D --> E[Gated Graders]
-    E --> F[Observation + Reward]
-```
+graph TD
+    subgraph HTTP["🌐 OpenEnv HTTP Surface"]
+        R1["POST /reset"]
+        R2["POST /step"]
+        R3["GET /state"]
+        R4["GET /health"]
+    end
 
-### Multi-Agent
+    HTTP -->|"ATCAction\n{aman_completion, dman_completion, round_type}"| ENV
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    OpenEnv HTTP Surface                       │
-│  POST /reset   POST /step   GET /state   GET /health          │
-└───────────────────────┬──────────────────────────────────────┘
-                        │ ATCAction {aman_completion, dman_completion, round_type}
-                        ▼
-              ┌──────────────────┐
-              │  ATCEnvironment  │  (server/atc_environment.py)
-              └────────┬─────────┘
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-   ┌─────────────┐  ┌──────────┐  ┌──────────────────┐
-   │ AMAN prompt │  │  DMAN    │  │ ChallengeGenerator│
-   │ (arrivals)  │  │  prompt  │  │ EMA curriculum   │
-   └──────┬──────┘  └────┬─────┘  └──────────────────┘
-          │              │
-          └──────┬───────┘
-                 ▼
-    ┌─────────────────────────┐
-    │ MultiAgentATCEnvironment│
-    │  Round 0: BID           │
-    │  Round 1: NEGOTIATE     │
-    │  Round 2: FINAL         │
-    └──────────┬──────────────┘
-               ▼
-    ┌─────────────────────────┐
-    │   simulate_plan()       │
-    │   + graders.py          │
-    └──────────┬──────────────┘
-               ▼
-    ┌──────────────────────────┐
-    │  Reward functions         │
-    │  ├─ aman_reward_fn()     │
-    │  ├─ dman_reward_fn()     │
-    │  ├─ generator_reward_fn  │
-    │  └─ supervisor_reward_fn │
-    └──────────────────────────┘
+    subgraph ENV["⚙️ ATCEnvironment  ·  server/atc_environment.py"]
+        direction TB
+        subgraph Agents["Agents  —  partial observability enforced"]
+            AMAN["✈️ AMAN\nArrivals only"]
+            DMAN["🛫 DMAN\nDepartures only"]
+        end
+        GEN["🎲 ChallengeGenerator\nEMA curriculum · 6 difficulty levels"]
+        SUP["🎯 SupervisorAgent\n5 rotating preference profiles"]
+    end
+
+    AMAN & DMAN -->|"slots + messages"| MA
+    GEN -->|"task mutation"| MA
+    SUP -->|"active preference profile"| MA
+
+    subgraph MA["🔄 MultiAgentATCEnvironment"]
+        B0["Round 0 · BID"] --> B1["Round 1 · NEGOTIATE"] --> B2["Round 2 · FINAL"]
+    end
+
+    MA --> SIM
+
+    subgraph SIM["🖥️ simulate_plan  +  graders.py"]
+        SG["🛡️ Safety Gate\nconflict cap · emg cap · coverage floor"]
+        PR["📋 Priority Rubric\nemergency + priority handling"]
+        EF["⚡ Efficiency Rubric\ndelay · throughput"]
+        SG --> PR --> EF
+    end
+
+    SIM --> RW
+
+    subgraph RW["🏆 Reward Functions"]
+        RA["aman_reward_fn"]
+        RD["dman_reward_fn"]
+        RG["generator_reward_fn"]
+        RS["supervisor_reward_fn"]
+    end
 ```
 
 *AMAN and DMAN cannot read each other's observations. Information crosses the boundary only through the message channel.*
