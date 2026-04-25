@@ -247,17 +247,31 @@ class ADAPTObservation(BaseModel):
                 "",
             ]
 
+        n = max(1, len(self.entity_profiles))
+        max_emg = 1
+        max_heavy = max(1, n // 3)
+        max_med = max(1, -(-n // 3))   # ceil
+
         lines += [
             "-" * 60,
             f"SUPERVISOR TODAY: {self.supervisor_description}",
+            "",
+            "PRIORITY DISTRIBUTION BUDGET (hard constraint — starvation prevention):",
+            f"  emergency : exactly {max_emg} entity type maximum",
+            f"  H wake    : at most {max_heavy} entity type(s)",
+            f"  medical   : at most {max_med} entity type(s)  (after emergency is assigned)",
+            "  Exceeding these budgets causes AMAN to starve DMAN of runway time.",
+            "  If multiple types qualify for emergency, assign it only to the SINGLE",
+            "  highest urgency scorer and demote the rest to medical.",
             "",
             "INSTRUCTIONS:",
             "1. You do NOT know what domain this is. Reason from the structural numbers.",
             "2. High time_pressure + high connection_risk → H/emergency mapping.",
             "3. Flexible windows + low risk → L/normal mapping.",
-            "4. Map each entity type to wake_class (H/M/L) and priority "
+            "4. Enforce the budget above — cite budget slot usage in rationale.",
+            "5. Map each entity type to wake_class (H/M/L) and priority "
             "(emergency/medical/connection/normal).",
-            "5. Cite the specific numbers in your rationale.",
+            "6. Cite the specific numbers in your rationale.",
         ]
         return "\n".join(lines)
 

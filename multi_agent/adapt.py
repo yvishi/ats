@@ -121,31 +121,59 @@ def _compute_entity_profiles(task: TaskDefinition) -> Dict[str, Dict[str, Any]]:
     return profiles
 
 
+# ── Priority / wake-class tier ordering ──────────────────────────────────────
+
+_PRIORITY_TIERS = [
+    PriorityClass.EMERGENCY.value,
+    PriorityClass.MEDICAL.value,
+    PriorityClass.CONNECTION.value,
+    PriorityClass.NORMAL.value,
+]
+_WAKE_TIERS = [WakeClass.HEAVY.value, WakeClass.MEDIUM.value, WakeClass.LIGHT.value]
+
+
+def _demote_priority(priority: str) -> str:
+    """Return the next-lower priority tier (floor at normal)."""
+    idx = _PRIORITY_TIERS.index(priority) if priority in _PRIORITY_TIERS else len(_PRIORITY_TIERS) - 1
+    return _PRIORITY_TIERS[min(idx + 1, len(_PRIORITY_TIERS) - 1)]
+
+
+def _demote_wake(wake: str) -> str:
+    """Return the next-lower wake class (floor at light)."""
+    idx = _WAKE_TIERS.index(wake) if wake in _WAKE_TIERS else len(_WAKE_TIERS) - 1
+    return _WAKE_TIERS[min(idx + 1, len(_WAKE_TIERS) - 1)]
+
+
 # ── Structural heuristic fallback ─────────────────────────────────────────────
 
 def _build_adapt_heuristic(obs: ADAPTObservation, task: TaskDefinition) -> ADAPTAction:
-    """Structural heuristic — no keyword tables, no domain knowledge.
+    """Structural heuristic with priority-budget enforcement.
 
-    Derives ATC wake class and priority purely from per-entity-type statistics:
-
-    Wake class thresholds (combined urgency score):
+    Step 1 — Raw scoring (per entity type, no domain knowledge):
       urgency_score = 0.50 × time_pressure + 0.40 × connection_risk + 0.10 × urgency_flag
-      ≥ 0.70  → H (Heavy)
-      ≥ 0.35  → M (Medium)
-      < 0.35  → L (Light)
 
-    Priority thresholds (connection_risk + time_pressure):
-      cr ≥ 0.80  or  (tp ≥ 0.95 and urgency)  → emergency
-      cr ≥ 0.50  or  tp ≥ 0.80                 → medical
-      cr ≥ 0.20  or  tp ≥ 0.60                 → connection
-      else                                      → normal
+      Wake class raw thresholds:   ≥ 0.70 → H  |  ≥ 0.35 → M  |  else → L
+      Priority raw thresholds:
+        cr ≥ 0.80  or  (tp ≥ 0.95 and urgency)  → emergency
+        cr ≥ 0.50  or  tp ≥ 0.80                 → medical
+        cr ≥ 0.20  or  tp ≥ 0.60                 → connection
+        else                                      → normal
+
+    Step 2 — Budget enforcement (prevents all-emergency starvation):
+      Entities sorted by urgency_score desc; budgets applied top-down:
+        max_emergency = 1               (exactly one entity type may be emergency)
+        max_heavy     = max(1, N // 3)  (at most 1/3 of types as H)
+        max_medical   = max(1, ceil(N / 3))  (after emergency slot is claimed)
+      Entities that exceed a budget are demoted one tier automatically.
+
+    This ensures AMAN/DMAN always see a realistic priority distribution and
+    avoids the starvation failure mode where AMAN yields all capacity to
+    emergencies and DMAN has no runway time left.
     """
-    # Use profiles already computed in obs if available; else recompute.
     profiles: Dict[str, Dict[str, Any]] = obs.entity_profiles or _compute_entity_profiles(task)
 
-    entity_wake_map: Dict[str, str] = {}
-    entity_priority_map: Dict[str, str] = {}
-    rationale_parts: List[str] = []
+    # ── Step 1: raw scores ────────────────────────────────────────────────────
+    raw: List[tuple] = []   # (entity_type, urgency_score, raw_wake, raw_priority)
 
     for entity_type, p in profiles.items():
         tp      = p["time_pressure"]
@@ -155,33 +183,82 @@ def _build_adapt_heuristic(obs: ADAPTObservation, task: TaskDefinition) -> ADAPT
         urgency_score = 0.50 * tp + 0.40 * cr + 0.10 * float(urgency)
 
         if urgency_score >= 0.70:
-            wake = WakeClass.HEAVY.value
+            raw_wake = WakeClass.HEAVY.value
         elif urgency_score >= 0.35:
-            wake = WakeClass.MEDIUM.value
+            raw_wake = WakeClass.MEDIUM.value
         else:
-            wake = WakeClass.LIGHT.value
+            raw_wake = WakeClass.LIGHT.value
 
         if cr >= 0.80 or (tp >= 0.95 and urgency):
-            priority = PriorityClass.EMERGENCY.value
+            raw_priority = PriorityClass.EMERGENCY.value
         elif cr >= 0.50 or tp >= 0.80:
-            priority = PriorityClass.MEDICAL.value
+            raw_priority = PriorityClass.MEDICAL.value
         elif cr >= 0.20 or tp >= 0.60:
-            priority = PriorityClass.CONNECTION.value
+            raw_priority = PriorityClass.CONNECTION.value
         else:
-            priority = PriorityClass.NORMAL.value
+            raw_priority = PriorityClass.NORMAL.value
 
-        entity_wake_map[entity_type]    = wake
+        raw.append((entity_type, urgency_score, raw_wake, raw_priority, p))
+
+    # ── Step 2: budget enforcement — sort by urgency desc ────────────────────
+    n_types = max(1, len(raw))
+    max_emergency = 1
+    max_heavy     = max(1, n_types // 3)
+    max_medical   = max(1, -(-n_types // 3))   # ceil(N / 3)
+
+    raw.sort(key=lambda x: x[1], reverse=True)
+
+    entity_wake_map: Dict[str, str] = {}
+    entity_priority_map: Dict[str, str] = {}
+    rationale_parts: List[str] = []
+
+    emergency_used = 0
+    medical_used   = 0
+    heavy_used     = 0
+
+    for entity_type, urgency_score, raw_wake, raw_priority, p in raw:
+        # ── wake budget ───────────────────────────────────────────────────────
+        wake = raw_wake
+        if wake == WakeClass.HEAVY.value:
+            if heavy_used < max_heavy:
+                heavy_used += 1
+            else:
+                wake = _demote_wake(wake)
+
+        # ── priority budget ───────────────────────────────────────────────────
+        priority = raw_priority
+
+        if priority == PriorityClass.EMERGENCY.value:
+            if emergency_used < max_emergency:
+                emergency_used += 1
+            else:
+                priority = _demote_priority(priority)   # → medical
+
+        if priority == PriorityClass.MEDICAL.value:
+            if medical_used < max_medical:
+                medical_used += 1
+            else:
+                priority = _demote_priority(priority)   # → connection
+
+        entity_wake_map[entity_type]     = wake
         entity_priority_map[entity_type] = priority
+
+        demoted_wake = " (budget-demoted)" if wake != raw_wake else ""
+        demoted_pri  = " (budget-demoted)" if priority != raw_priority else ""
         rationale_parts.append(
-            f"{entity_type}: window={p['avg_window_minutes']:.0f}min "
-            f"tp={tp:.2f} cr={cr:.2f} urgency={urgency} "
-            f"→ score={urgency_score:.2f} → wake={wake} priority={priority}"
+            f"{entity_type}: tp={p['time_pressure']:.2f} cr={p['avg_connection_risk']:.2f} "
+            f"score={urgency_score:.2f} "
+            f"→ wake={wake}{demoted_wake} priority={priority}{demoted_pri}"
         )
 
     return ADAPTAction(
         entity_wake_map=entity_wake_map,
         entity_priority_map=entity_priority_map,
-        rationale="Structural inference (no domain knowledge): " + "; ".join(rationale_parts),
+        rationale=(
+            f"Structural budget-enforced inference "
+            f"(budget: emergency≤{max_emergency} heavy≤{max_heavy} medical≤{max_medical}): "
+            + "; ".join(rationale_parts)
+        ),
     )
 
 

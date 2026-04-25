@@ -559,6 +559,10 @@ def adapt_reward_fn(
             rewards.append(-0.5)
             continue
 
+        # Penalise degenerate priority distributions before even running the episode.
+        # Over-mapping to emergency causes AMAN starvation and score collapse.
+        distribution_penalty = _adapt_distribution_penalty(adapt_action)
+
         mapped_task = apply_adapt_mapping(domain_task, adapt_action)
         profile = _safe_supervisor_profile(profile_str)
 
@@ -590,13 +594,52 @@ def adapt_reward_fn(
 
             improvement = outcome.normalized_score - base_outcome.normalized_score
             rationale_bonus = min(0.10, len(adapt_action.rationale.strip()) / 500.0)
-            reward = max(-1.0, min(1.0, outcome.normalized_score + 0.15 * improvement + rationale_bonus))
+            reward = max(-1.0, min(1.0,
+                outcome.normalized_score
+                + 0.15 * improvement
+                + rationale_bonus
+                - distribution_penalty
+            ))
         except Exception:
-            reward = -0.5
+            reward = max(-1.0, -0.5 - distribution_penalty)
 
         rewards.append(round(reward, 4))
 
     return rewards
+
+
+def _adapt_distribution_penalty(action: "ADAPTAction") -> float:  # type: ignore[name-defined]
+    """Penalise degenerate priority distributions that cause AMAN/DMAN starvation.
+
+    Two violations, each worth up to 0.30:
+      1. emergency_overuse: more than 1 entity type mapped to emergency
+         → penalty = 0.30 × (excess_count / n_types)
+      2. high_tier_concentration: >60% of entity types mapped to emergency+medical
+         → penalty = 0.30 × (concentration − 0.60) / 0.40  [scales 0→0.30]
+
+    Total penalty is capped at 0.50 so a correct mapping is never blocked from
+    achieving a positive reward.
+    """
+    pri_map = action.entity_priority_map
+    if not pri_map:
+        return 0.0
+
+    n_types = len(pri_map)
+    emergency_count = sum(1 for v in pri_map.values() if v == PriorityClass.EMERGENCY.value)
+    medical_count   = sum(1 for v in pri_map.values() if v == PriorityClass.MEDICAL.value)
+    high_tier_count = emergency_count + medical_count
+
+    # Penalty 1: more than 1 emergency type
+    excess_emg = max(0, emergency_count - 1)
+    emg_penalty = 0.30 * (excess_emg / n_types) if excess_emg > 0 else 0.0
+
+    # Penalty 2: >60% of types at high tier (emergency + medical)
+    concentration = high_tier_count / n_types
+    conc_penalty = 0.0
+    if concentration > 0.60:
+        conc_penalty = 0.30 * min(1.0, (concentration - 0.60) / 0.40)
+
+    return round(min(0.50, emg_penalty + conc_penalty), 4)
 
 
 def _json_format_score(completion: Any) -> float:

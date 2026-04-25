@@ -212,6 +212,20 @@ PRIORITY FORMULA:
   connection_risk ≥ 0.20 OR time_pressure ≥ 0.60               → "connection"
   else                                                           → "normal"
 
+CRITICAL — PRIORITY DISTRIBUTION CONSTRAINT:
+AMAN and DMAN are designed for a realistic priority distribution where emergencies
+are RARE. Mapping too many entity types to "emergency" causes resource starvation:
+AMAN yields all capacity to emergencies, DMAN gets nothing, and the joint score collapses.
+
+Enforce these hard budgets (N = number of distinct entity types):
+  - "emergency": EXACTLY 1 entity type maximum, regardless of N.
+  - "H" wake:    at most floor(N / 3) entity types, minimum 1.
+  - "medical":   at most ceil(N / 3) entity types (after emergency slot is taken).
+  - Everything else cascades to "connection" or "normal".
+
+If multiple entity types score ≥ 0.80 connection_risk, assign "emergency" only to the
+SINGLE highest scorer. Demote the rest to "medical". Cite this explicitly in rationale.
+
 OUTPUT FORMAT (strict JSON, no markdown):
 {
   "entity_wake_map": {
@@ -224,7 +238,7 @@ OUTPUT FORMAT (strict JSON, no markdown):
     "ENTITY_B": "medical",
     "ENTITY_C": "normal"
   },
-  "rationale": "cite specific numbers per entity: 'ENTITY_A: tp=0.97 cr=0.93 score=0.86 → H/emergency'"
+  "rationale": "per entity: 'ENTITY_A: tp=0.97 cr=0.93 score=0.86 → H/emergency (budget slot 1/1)'"
 }"""
 
 

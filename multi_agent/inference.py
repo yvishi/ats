@@ -408,9 +408,10 @@ def run_episode(
         mutated_task, solvable = generator.mutate(base_task)
         gen_difficulty = generator.difficulty_level
         mutations_applied = [
-            m.mutation_type.value
+            m["type"]
             for m in getattr(generator, "_mutation_history", [])[-3:]
         ]
+
     else:
         mutated_task, solvable = base_task, True
         gen_difficulty = 1
