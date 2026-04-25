@@ -124,7 +124,7 @@ WARMUP_RATIO   = 0.05
 LOGGING_STEPS  = 1
 SAVE_STEPS     = 50
 SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
-EVAL_EPISODES  = 20
+EVAL_EPISODES  = 3
 STAGE_EPOCHS = {
     "stage_a": 0.45,  # AMAN + DMAN only
     "stage_b": 0.30,  # add sampled generator/supervisor
