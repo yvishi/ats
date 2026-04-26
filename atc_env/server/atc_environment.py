@@ -162,8 +162,8 @@ class ATCEnvironment(_EnvBase):
             for _ in range(1, MAX_NEGOTIATE_ROUNDS):
                 if count_separation_issues(self._env._state.conflict_log) == 0:
                     break
-                aman_h = _build_aman_heuristic(aman_obs, separation_repair=True)
-                dman_h = _build_dman_heuristic(dman_obs, atfm, separation_repair=True)
+                aman_h = _build_aman_heuristic(aman_obs, separation_repair=1)
+                dman_h = _build_dman_heuristic(dman_obs, atfm, separation_repair=1)
                 aman_obs, dman_obs, partial_reward, _ = self._env.step_negotiate(
                     aman_h, dman_h
                 )

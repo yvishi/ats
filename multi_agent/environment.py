@@ -76,7 +76,9 @@ except ImportError:
     from multi_agent.supervisor import SupervisorAgent
 
 
-MAX_NEGOTIATE_ROUNDS = 2   # max negotiation passes before forced merge
+MAX_NEGOTIATE_ROUNDS = 2   # max negotiation passes before forced merge (native ATC episodes)
+# ADAPT/ICU (domain transfer) remapped tasks are often window-tight; allow extra repair passes
+DOMAIN_MAX_NEGOTIATE_ROUNDS = 4
 ATFM_DEADLINE_HEADROOM = 8  # minutes of margin to call an ATFM violation
 
 

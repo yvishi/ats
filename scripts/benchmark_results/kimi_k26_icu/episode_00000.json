@@ -1,0 +1,53 @@
+{
+  "episode_id": 0,
+  "domain_task_id": "icu_mass_casualty",
+  "mode": "adapt_domain_transfer",
+  "supervisor_profile": "safety_strict",
+  "adapt_wake_map": {
+    "TRAUMA": "H",
+    "CARDIAC": "M",
+    "POST_OP": "M",
+    "ROUTINE": "L"
+  },
+  "adapt_priority_map": {
+    "TRAUMA": "emergency",
+    "CARDIAC": "medical",
+    "POST_OP": "medical",
+    "ROUTINE": "connection"
+  },
+  "adapt_rationale": "Structural budget-enforced inference (budget: emergency\u22641 heavy\u22641 medical\u22642): TRAUMA: tp=0.98 cr=0.93 score=0.96 \u2192 wake=H priority=emergency; CARDIAC: tp=0.85 cr=0.64 score=0.78 \u2192 wake=M (budget-demoted) priority=medical; POST_OP: tp=0.96 cr=0.00 score=0.58 \u2192 wake=M priority=medical (budget-demoted); ROUTINE: tp=0.68 cr=0.00 score=0.34 \u2192 wake=L priority=connection",
+  "rounds": [
+    {
+      "round": "BID",
+      "partial_reward": 0.0981,
+      "separation_issues_detected": 3,
+      "diagnostics_count": 12,
+      "aman_slots": 9,
+      "dman_slots": 4,
+      "aman_messages": 9,
+      "dman_messages": 4,
+      "done": false
+    },
+    {
+      "round": "NEGOTIATE",
+      "negotiate_pass": 1,
+      "partial_reward": 0.1098,
+      "separation_issues_before": 3,
+      "separation_issues_after": 2,
+      "diagnostics_count": 11,
+      "conflicts_resolved": 1,
+      "total_messages": 13,
+      "aman_alternatives_offered": 0,
+      "dman_alternatives_offered": 0,
+      "used_llm": false
+    }
+  ],
+  "final": {
+    "composite_score": 0.2768,
+    "aman_reward": 0.3957,
+    "dman_reward": 0.4538,
+    "coordination_score": 0.5682,
+    "cross_lane_conflicts": 2,
+    "negotiation_rounds": 1
+  }
+}

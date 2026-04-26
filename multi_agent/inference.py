@@ -43,6 +43,7 @@ from models import (
 from planner import build_heuristic_plan, build_refined_plan, _flight_sort_key
 from tasks import task_catalog, ordered_tasks
 from multi_agent.environment import (
+    DOMAIN_MAX_NEGOTIATE_ROUNDS,
     MAX_NEGOTIATE_ROUNDS,
     MultiAgentATCEnvironment,
     count_separation_issues,
@@ -76,6 +77,17 @@ BENCHMARK    = "atc_multiagent_openenv"
 MAX_TOKENS   = 1024
 TEMPERATURE  = 0.3
 SUCCESS_THRESHOLD = 0.60
+
+# N appended to AMAN/DMAN system prompts during ADAPT → ATC runs (bid + 1st negotiate LLM pass).
+# Focuses the model on clearing separation conflicts the heuristic pipeline often leaves on
+# tight remapped windows (e.g. ICU/ADAPT), without naming the source domain.
+_DOMAIN_TRANSFER_LLM_HINT = (
+    "STRUCTURAL-TRANSFER SCHEDULE: windows may be tight after cross-domain remapping. "
+    "In NEGOTIATE, use the CONFLICT LOG: shift arrival/departure minutes on shared runways to "
+    "satisfy minimum separation, staggering arrivals vs departures when the log says spacing "
+    "or wake conflicts. Prefer the smallest time moves that clear diagnostics; do not miss "
+    "ATFM/departure network deadlines (DMAN)."
+)
 
 
 # ── Structured logging ────────────────────────────────────────────────────────
@@ -114,13 +126,15 @@ def log_end(
 
 def _build_aman_heuristic(
     obs: MultiAgentObservation,
-    separation_repair: bool = False,
+    separation_repair: int = 0,
 ) -> AMANAction:
     """Deterministic arrival sequencer — priority-sorted, wake-turbulence aware.
 
-    When ``separation_repair`` is True (later negotiate passes), apply +1 minute
-    spacing slack and widen emergency-yield buffers to break residual tight pairs.
+    ``separation_repair`` (0 = off): in later negotiate passes, add N minutes to
+    required wake/ spacing gaps and widen DMAN emergency buffers to clear residual
+    cross-runway conflicts (stronger for larger N; typical 1–3).
     """
+    repair = max(0, int(separation_repair))
     arrivals = sorted(obs.my_flights, key=_flight_sort_key)
     runway_last: Dict[str, Tuple[int, str]] = {
         r.runway_id: (0, "M") for r in obs.all_runways
@@ -153,14 +167,14 @@ def _build_aman_heuristic(
             wake_gap = SEPARATION_BY_WAKE.get(
                 (last_wake, flight.wake_class.value), 3
             )
-            min_gap = max(cap_gap, wake_gap) + (1 if separation_repair else 0)
+            min_gap = max(cap_gap, wake_gap) + repair
             earliest = max(flight.earliest_minute, last_min + min_gap)
 
             if earliest > flight.latest_minute:
                 continue
 
-            em_buf = 4 if separation_repair else 3
-            bump = 4 if separation_repair else 3
+            em_buf = 3 + max(1, repair)
+            bump = 3 + max(1, repair)
             # Avoid DMAN emergency slots (±em_buf min)
             blocked = any(
                 rwy_id == er and abs(earliest - et) < em_buf
@@ -218,7 +232,7 @@ def _build_aman_heuristic(
         arrival_slots=slots,
         rationale=f"Heuristic AMAN: {len(slots)}/{len(arrivals)} arrivals sequenced, "
                   f"priority-sorted, wake-turbulence aware"
-                  f"{', separation-repair slack' if separation_repair else ''}.",
+                  f"{f', separation-repair (level {repair})' if repair else ''}.",
         emergency_yields=emergency_yields,
         outgoing_messages=messages,
         commit=False,
@@ -230,13 +244,14 @@ def _build_aman_heuristic(
 def _build_dman_heuristic(
     obs: MultiAgentObservation,
     atfm_deadlines: Dict[str, int],
-    separation_repair: bool = False,
+    separation_repair: int = 0,
 ) -> DMANAction:
     """Deterministic departure sequencer — ATFM-aware, emergency priority.
 
-    When ``separation_repair`` is True, use +1 minute wake slack and ±4 min
-    AMAN-claim buffers to clear residual cross-lane spacing violations.
+    ``separation_repair`` (0 = off): add N minutes to wake gaps and expand buffers
+    around AMAN-claimed times to break residual cross-lane spacing (larger N = more slack).
     """
+    repair = max(0, int(separation_repair))
     from constants import SEPARATION_BY_WAKE
     from engine import _capacity_spacing
     from planner import PRIORITY_RANK
@@ -289,13 +304,13 @@ def _build_dman_heuristic(
             last_min, last_wake = runway_last.get(rwy_id, (0, "M"))
             cap_gap  = _capacity_spacing(rwy)
             wake_gap = SEPARATION_BY_WAKE.get((last_wake, flight.wake_class.value), 3)
-            min_gap  = max(cap_gap, wake_gap) + (1 if separation_repair else 0)
+            min_gap  = max(cap_gap, wake_gap) + repair
             earliest = max(flight.earliest_minute, last_min + min_gap)
 
             if earliest > flight.latest_minute:
                 continue
 
-            claim_buf = 4 if separation_repair else 3
+            claim_buf = 3 + max(1, repair)
             # Avoid AMAN-claimed slots (±claim_buf min) unless this is an emergency
             if not is_emg:
                 aman_mins = aman_claims.get(rwy_id, [])
@@ -347,7 +362,7 @@ def _build_dman_heuristic(
         departure_slots=slots,
         rationale=f"Heuristic DMAN: {len(slots)}/{len(departures)} departures sequenced, "
                   f"ATFM-compliant, emergency-priority"
-                  f"{', separation-repair slack' if separation_repair else ''}.",
+                  f"{f', separation-repair (level {repair})' if repair else ''}.",
         atfm_compliance=atfm_compliance,
         emergency_broadcasts=emergency_broadcasts,
         outgoing_messages=messages,
@@ -365,15 +380,19 @@ def _llm_action(
     sup_desc: str,
     role: AgentRole,
     temperature: Optional[float] = None,
+    system_extra: str = "",
 ) -> Optional[AMANAction | DMANAction]:
     if client is None:
         return None
     temp = TEMPERATURE if temperature is None else temperature
+    system_content = system + f"\n\nSUPERVISOR TODAY: {sup_desc}"
+    if (system_extra or "").strip():
+        system_content = system_content + "\n\n" + system_extra.strip()
     try:
         resp = client.chat.completions.create(
             model=model_name,
             messages=[
-                {"role": "system", "content": system + f"\n\nSUPERVISOR TODAY: {sup_desc}"},
+                {"role": "system", "content": system_content},
                 {"role": "user",   "content": obs.to_prompt_text()},
             ],
             temperature=temp,
@@ -397,16 +416,25 @@ def _negotiate_multi_pass(
     dman_obs_start: MultiAgentObservation,
     atfm: Dict[str, int],
     rounds: List[Dict[str, Any]],
+    max_passes: Optional[int] = None,
+    llm_system_extra: str = "",
 ) -> Tuple[MultiAgentObservation, MultiAgentObservation]:
-    """Up to MAX_NEGOTIATE_ROUNDS revision passes on separation conflicts.
+    """Revision passes on separation conflicts until resolved or cap reached.
 
     Pass 1 uses the LLM when ``client`` is set (lower temperature for stability);
-    subsequent passes use heuristics only to recover when the LLM worsens spacing.
+    later passes use tiered separation-repair heuristics (0 = off; higher passes
+    add more inter-slot slack).  Native ATC uses 2 / 1 passes (with/without client);
+    ADAPT domain transfer uses DOMAIN_MAX_NEGOTIATE_ROUNDS for more repair attempts.
     """
     aman_cur, dman_cur = aman_obs_start, dman_obs_start
-    max_passes = MAX_NEGOTIATE_ROUNDS if client is not None else 1
+    if max_passes is not None:
+        max_p = int(max_passes)
+    elif client is not None:
+        max_p = MAX_NEGOTIATE_ROUNDS
+    else:
+        max_p = 1
 
-    for neg_r in range(1, max_passes + 1):
+    for neg_r in range(1, max_p + 1):
         sep_before = count_separation_issues(env._state.conflict_log)
         if sep_before == 0:
             break
@@ -422,6 +450,7 @@ def _negotiate_multi_pass(
                     sup_desc,
                     AgentRole.AMAN,
                     temperature=0.2,
+                    system_extra=llm_system_extra,
                 )
                 or _build_aman_heuristic(aman_cur)
             )
@@ -434,11 +463,12 @@ def _negotiate_multi_pass(
                     sup_desc,
                     AgentRole.DMAN,
                     temperature=0.2,
+                    system_extra=llm_system_extra,
                 )
                 or _build_dman_heuristic(dman_cur, atfm)
             )
         else:
-            repair = neg_r >= 2
+            repair = 0 if neg_r == 1 else min(neg_r - 1, 3)
             aman_action = _build_aman_heuristic(aman_cur, separation_repair=repair)
             dman_action = _build_dman_heuristic(dman_cur, atfm, separation_repair=repair)
 
@@ -716,11 +746,27 @@ def run_domain_episode(
     dman_action = _build_dman_heuristic(dman_obs, atfm)
     if client is not None:
         aman_action = (
-            _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
+            _llm_action(
+                client,
+                selected_model,
+                AMAN_SYSTEM,
+                aman_obs,
+                sup_desc,
+                AgentRole.AMAN,
+                system_extra=_DOMAIN_TRANSFER_LLM_HINT,
+            )
             or aman_action
         )
         dman_action = (
-            _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
+            _llm_action(
+                client,
+                selected_model,
+                DMAN_SYSTEM,
+                dman_obs,
+                sup_desc,
+                AgentRole.DMAN,
+                system_extra=_DOMAIN_TRANSFER_LLM_HINT,
+            )
             or dman_action
         )
 
@@ -751,6 +797,8 @@ def run_domain_episode(
             dman_obs2,
             atfm,
             rounds,
+            max_passes=DOMAIN_MAX_NEGOTIATE_ROUNDS,
+            llm_system_extra=_DOMAIN_TRANSFER_LLM_HINT if client is not None else "",
         )
 
     result = env.finalize()
