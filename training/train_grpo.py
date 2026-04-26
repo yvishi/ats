@@ -636,6 +636,7 @@ def train(
     domain_stratify: bool = True,
     stage_epoch_scale: float = 1.0,
     adapt_eval_episodes: Optional[int] = None,
+    sft_adapter_dir: Optional[str] = None,
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
     _configure_runtime_warnings()
@@ -706,18 +707,41 @@ def train(
     # Prevent generate() ambiguity warnings from inherited max_length defaults.
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.max_length = None
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_rank,
-        lora_alpha=LORA_ALPHA,
-        target_modules=LORA_TARGETS,
-        lora_dropout=0.0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=seed,
-    )
+
+    sft_path: Optional[Path] = None
+    if sft_adapter_dir:
+        _sp = Path(sft_adapter_dir).expanduser()
+        if _sp.is_dir() and (_sp / "adapter_config.json").exists():
+            sft_path = _sp
+
+    if sft_path is not None:
+        print(f"    Continuing GRPO from SFT LoRA: {sft_path}")
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(model, str(sft_path), is_trainable=True)
+        if hasattr(model, "enable_input_require_grads"):
+            try:
+                model.enable_input_require_grads()
+            except Exception:
+                pass
+    else:
+        if sft_adapter_dir:
+            print(
+                f"    [WARN] --sft_adapter has no adapter_config.json: {sft_adapter_dir!r} "
+                "— training a fresh LoRA"
+            )
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_rank,
+            lora_alpha=LORA_ALPHA,
+            target_modules=LORA_TARGETS,
+            lora_dropout=0.0,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=seed,
+        )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"    LoRA rank={lora_rank}, trainable params: {trainable:,}")
+    print(f"    Trainable params: {trainable:,}")
 
     # ── 2b. Base model eval (before any gradient steps) ──────────────────────
     base_model_metrics: Optional[Dict[str, Any]] = None
@@ -1878,6 +1902,11 @@ def main() -> None:
         default=None,
         help="Episodes for ADAPT domain-pipeline eval (default: max(3, --eval_episodes)).",
     )
+    parser.add_argument(
+        "--sft_adapter",
+        default=None,
+        help="Directory with SFT LoRA (adapter_config.json + weights) to initialize GRPO.",
+    )
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -1918,6 +1947,7 @@ def main() -> None:
             domain_stratify=not args.no_domain_stratify,
             stage_epoch_scale=float(args.stage_epoch_scale),
             adapt_eval_episodes=args.adapt_eval_episodes,
+            sft_adapter_dir=args.sft_adapter,
         )
 
 
