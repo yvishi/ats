@@ -282,12 +282,13 @@ def main() -> None:
         (tmp_p / "Dockerfile").write_text(_dockerfile(), encoding="utf-8")
         (tmp_p / "entrypoint.sh").write_text(_entrypoint(args), encoding="utf-8")
         (tmp_p / "hf_push_outputs.py").write_text(PUSH_SCRIPT, encoding="utf-8")
+        # Minimal frontmatter: `startup_duration_timeout` in README has caused Hub validation
+        # errors (e.g. "max 6h"). Omit it; use default startup behavior. Long Docker *builds* are
+        # separate from this knob — adjust in Space → Settings on HF if build still times out.
         readme = textwrap.dedent(f"""\
             ---
             title: ATC GRPO Runner
             sdk: docker
-            hardware: {args.hardware}
-            startup_duration_timeout: 6h
             ---
 
             # ATC training on GPU
@@ -297,7 +298,7 @@ def main() -> None:
 
             **Secrets:** `HF_TOKEN` (required). `GITHUB_TOKEN` only if the Git repo is private.
 
-            Logs: Space **Logs** tab. Long runs: hardware tab may need a larger GPU tier.
+            **GPU:** set in Space **Settings → Hardware** to `{args.hardware}` (launcher also requests it via API).
         """)
         (tmp_p / "README.md").write_text(readme, encoding="utf-8")
 

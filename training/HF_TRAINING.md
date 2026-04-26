@@ -95,7 +95,8 @@ This repo’s **Spaces** path is the most integrated “one script” experience
 | Issue | What to try |
 |-------|-------------|
 | **403** creating Space/model | Use your **real** `--hf_user` (profile URL slug), not the literal text `YOUR_HF_USERNAME`. Token must be **write** (classic) or fine-grained with **create repos** + **Spaces** for that account/org. |
-| Build timeout / killed | Space **README** sets `startup_duration_timeout: 6h` (HF max); upgrade GPU or shorten `--episodes` / omit `--run_sft`. |
+| **README / “Startup duration too large”** | The launcher only sets `title` + `sdk: docker` (no `startup_duration_timeout` — avoids HF’s `6h` cap errors). Re-run the launcher after updating the repo, or on the Space click **Files and versions** → **README.md** and remove any `startup_duration_timeout: 8h` left from an old run. |
+| Build timeout / killed | Shorter image build: pin fewer pip deps; in Space **Settings** some accounts can raise build/startup limits. Shorten training (`--episodes`, `--no_eval`). |
 | CUDA OOM | `--hardware a10g-small` or larger; lower `--batch_size`, `--max_new_tokens`, or use a smaller `--model`. |
 | Clone fails | Public repo: leave `GITHUB_TOKEN` unset. Private: pass `--github_token` and ensure Space secret is set. |
 | Empty adapter repo | Check **Logs** for tracebacks; confirm `HF_TOKEN` has **write** and `hf_push_outputs.py` ran. |
