@@ -779,6 +779,13 @@ def train(
     if _config_supports("use_vllm", GRPOConfig):
         grpo_kwargs["use_vllm"] = False
 
+    if _config_supports("logging_strategy", GRPOConfig):
+        grpo_kwargs["logging_strategy"] = "steps"
+    if _config_supports("logging_first_step", GRPOConfig):
+        grpo_kwargs["logging_first_step"] = True
+    if _config_supports("disable_tqdm", GRPOConfig):
+        grpo_kwargs["disable_tqdm"] = False
+
     grpo_config = GRPOConfig(**grpo_kwargs)
 
     # ── 5. Per-role reward logger ─────────────────────────────────────────────
@@ -963,66 +970,89 @@ def train(
 
     trainer = GRPOTrainer(**trainer_kwargs)
 
+    def _print_live_metrics(args, state, logs=None, *, prefix: str = "[LIVE]") -> None:
+        """One stdout line of trainer + reward tail stats (used each log step and each epoch)."""
+        logs = logs or {}
+        if prefix == "[LIVE]" and not logs:
+            return
+        step = int(logs.get("step", getattr(state, "global_step", 0)) or 0)
+        max_steps = int(getattr(state, "max_steps", 0) or 0)
+        loss = logs.get("loss")
+        lr = logs.get("learning_rate")
+
+        def _avg_last(key: str, window: int = 64) -> float:
+            vals = reward_log.get(key, [])
+            if not vals:
+                return float("nan")
+            tail = vals[-min(window, len(vals)) :]
+            return sum(tail) / max(1, len(tail))
+
+        def _fmt(v: float) -> str:
+            return "n/a" if v != v else f"{v:.3f}"
+
+        def _parse_rate(role: str, window: int = 64) -> float:
+            vals = parse_log.get(role, [])
+            if not vals:
+                return float("nan")
+            tail = vals[-min(window, len(vals)) :]
+            return sum(tail) / max(1, len(tail))
+
+        def _tail_rate(store: Dict[str, List[int]], role: str, window: int = 64) -> float:
+            vals = store.get(role, [])
+            if not vals:
+                return float("nan")
+            tail = vals[-min(window, len(vals)) :]
+            return sum(tail) / max(1, len(tail))
+
+        comp = _avg_last("composite")
+        aman = _avg_last("AMAN")
+        dman = _avg_last("DMAN")
+        gen = _avg_last("GENERATOR")
+        sup = _avg_last("SUPERVISOR")
+        p_aman = _parse_rate("AMAN")
+        p_dman = _parse_rate("DMAN")
+        p_gen = _parse_rate("GENERATOR")
+        p_sup = _parse_rate("SUPERVISOR")
+        f_aman = _tail_rate(fallback_log, "AMAN")
+        f_dman = _tail_rate(fallback_log, "DMAN")
+        o_aman = _tail_rate(overflow_log, "AMAN")
+        o_dman = _tail_rate(overflow_log, "DMAN")
+        print(
+            f"{prefix} "
+            f"step={step}/{max_steps} "
+            f"loss={loss if loss is not None else 'n/a'} "
+            f"lr={lr if lr is not None else 'n/a'} "
+            f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
+            f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
+            f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)} G={_fmt(p_gen)} S={_fmt(p_sup)}] "
+            f"fb64[A={_fmt(f_aman)} D={_fmt(f_dman)}] "
+            f"ovf64[A={_fmt(o_aman)} D={_fmt(o_dman)}]",
+            flush=True,
+        )
+
     class LiveMetricsCallback(TrainerCallback):
         """Stream concise live metrics into notebook/stdout while training."""
 
         def on_log(self, args, state, control, logs=None, **kwargs):
-            logs = logs or {}
-            if not logs:
-                return
-            step = int(logs.get("step", getattr(state, "global_step", 0)) or 0)
-            max_steps = int(getattr(state, "max_steps", 0) or 0)
-            loss = logs.get("loss")
-            lr = logs.get("learning_rate")
+            _print_live_metrics(args, state, logs, prefix="[LIVE]")
 
-            def _avg_last(key: str, window: int = 64) -> float:
-                vals = reward_log.get(key, [])
-                if not vals:
-                    return float("nan")
-                tail = vals[-min(window, len(vals)) :]
-                return sum(tail) / max(1, len(tail))
-
-            def _fmt(v: float) -> str:
-                return "n/a" if v != v else f"{v:.3f}"
-            
-            def _parse_rate(role: str, window: int = 64) -> float:
-                vals = parse_log.get(role, [])
-                if not vals:
-                    return float("nan")
-                tail = vals[-min(window, len(vals)) :]
-                return sum(tail) / max(1, len(tail))
-
-            def _tail_rate(store: Dict[str, List[int]], role: str, window: int = 64) -> float:
-                vals = store.get(role, [])
-                if not vals:
-                    return float("nan")
-                tail = vals[-min(window, len(vals)) :]
-                return sum(tail) / max(1, len(tail))
-
-            comp = _avg_last("composite")
-            aman = _avg_last("AMAN")
-            dman = _avg_last("DMAN")
-            gen = _avg_last("GENERATOR")
-            sup = _avg_last("SUPERVISOR")
-            p_aman = _parse_rate("AMAN")
-            p_dman = _parse_rate("DMAN")
-            p_gen = _parse_rate("GENERATOR")
-            p_sup = _parse_rate("SUPERVISOR")
-            f_aman = _tail_rate(fallback_log, "AMAN")
-            f_dman = _tail_rate(fallback_log, "DMAN")
-            o_aman = _tail_rate(overflow_log, "AMAN")
-            o_dman = _tail_rate(overflow_log, "DMAN")
+        def on_epoch_end(self, args, state, control, **kwargs):
+            ep = float(getattr(state, "epoch", 0.0) or 0.0)
+            gs = int(getattr(state, "global_step", 0) or 0)
+            hist = list(getattr(state, "log_history", []) or [])
+            last = hist[-1] if hist else {}
+            loss = last.get("loss")
+            lr = last.get("learning_rate")
+            loss_s = f"{loss:.4f}" if isinstance(loss, (int, float)) else str(loss)
+            lr_s = f"{lr:.2e}" if isinstance(lr, (int, float)) else str(lr)
             print(
-                "[LIVE] "
-                f"step={step}/{max_steps} "
-                f"loss={loss if loss is not None else 'n/a'} "
-                f"lr={lr if lr is not None else 'n/a'} "
-                f"comp64={_fmt(comp)} AMAN={_fmt(aman)} DMAN={_fmt(dman)} "
-                f"GEN={_fmt(gen)} SUP={_fmt(sup)} "
-                f"parse64[A={_fmt(p_aman)} D={_fmt(p_dman)} G={_fmt(p_gen)} S={_fmt(p_sup)}] "
-                f"fb64[A={_fmt(f_aman)} D={_fmt(f_dman)}] "
-                f"ovf64[A={_fmt(o_aman)} D={_fmt(o_dman)}]"
+                f"\n{'='*60}\n"
+                f"  [GRPO] EPOCH END  epoch={ep:.2f}  global_step={gs}\n"
+                f"  last_log: loss={loss_s}  lr={lr_s}\n"
+                f"{'='*60}",
+                flush=True,
             )
+            _print_live_metrics(args, state, last, prefix="[GRPO EPOCH]")
 
     if hasattr(trainer, "add_callback"):
         live_cb = LiveMetricsCallback()
