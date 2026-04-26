@@ -80,13 +80,18 @@ def _dockerfile() -> str:
             git ca-certificates \\
             && rm -rf /var/lib/apt/lists/*
 
-        # Single pip layer: torch is in base image; unsloth from PyPI (not git).
+        # Base image ships torch+torchvision 2.4/0.19. Unsloth from PyPI upgrades torch (e.g. 2.10)
+        # but leaves torchvision stale → "torch==2.10.0 requires torchvision>=0.25.0". Re-align wheels
+        # from the official CUDA 12.1 index (must match the image CUDA / PyTorch cu121 build).
         RUN pip install --no-cache-dir --upgrade pip && \\
             pip install --no-cache-dir \\
-            "unsloth>=2024.8" \\
+            "unsloth>=2024.8" "unsloth-zoo" \\
             "trl>=0.9.6" "datasets>=2.20.0" "accelerate>=0.32.0" "peft>=0.12.0" "bitsandbytes>=0.43.0" \\
             "huggingface_hub>=0.26" "hf_transfer" "matplotlib>=3.9.0" "numpy>=1.26.0" \\
-            "openenv-core[core]>=0.2.3" "fastapi>=0.128.0" "openai>=2.30.0" "pydantic>=2.12.0" "uvicorn>=0.41.0"
+            "openenv-core[core]>=0.2.3" "fastapi>=0.128.0" "openai>=2.30.0" "pydantic>=2.12.0" "uvicorn>=0.41.0" \\
+            && pip install --no-cache-dir --upgrade \\
+            "torchvision>=0.25.0" "torchaudio>=2.10.0" \\
+            --index-url https://download.pytorch.org/whl/cu121
 
         WORKDIR /app
         COPY hf_push_outputs.py /app/hf_push_outputs.py
