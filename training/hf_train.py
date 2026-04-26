@@ -31,6 +31,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _write_unix_text(path: Path, data: str) -> None:
+    """Write UTF-8 with LF only. On Windows, Path.write_text() defaults to CRLF and breaks
+    Linux shebangs in Docker/Spaces: `/usr/bin/env: 'bash\\r': No such file or directory`."""
+    path.write_text(data, encoding="utf-8", newline="\n")
+
+
 PUSH_SCRIPT = textwrap.dedent("""\
     \"\"\"Push training outputs to HF Hub model repo.\"\"\"
     import argparse
@@ -279,9 +285,9 @@ def main() -> None:
     print("[2/4] Upload Dockerfile, entrypoint, push helper...")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_p = Path(tmp)
-        (tmp_p / "Dockerfile").write_text(_dockerfile(), encoding="utf-8")
-        (tmp_p / "entrypoint.sh").write_text(_entrypoint(args), encoding="utf-8")
-        (tmp_p / "hf_push_outputs.py").write_text(PUSH_SCRIPT, encoding="utf-8")
+        _write_unix_text(tmp_p / "Dockerfile", _dockerfile())
+        _write_unix_text(tmp_p / "entrypoint.sh", _entrypoint(args))
+        _write_unix_text(tmp_p / "hf_push_outputs.py", PUSH_SCRIPT)
         # Minimal frontmatter: `startup_duration_timeout` in README has caused Hub validation
         # errors (e.g. "max 6h"). Omit it; use default startup behavior. Long Docker *builds* are
         # separate from this knob — adjust in Space → Settings on HF if build still times out.
@@ -300,7 +306,7 @@ def main() -> None:
 
             **GPU:** set in Space **Settings → Hardware** to `{args.hardware}` (launcher also requests it via API).
         """)
-        (tmp_p / "README.md").write_text(readme, encoding="utf-8")
+        _write_unix_text(tmp_p / "README.md", readme)
 
         api.upload_folder(folder_path=str(tmp_p), repo_id=space_repo_id, repo_type="space")
 
