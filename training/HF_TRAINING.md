@@ -96,7 +96,8 @@ This repo’s **Spaces** path is the most integrated “one script” experience
 |-------|-------------|
 | **403** creating Space/model | Use your **real** `--hf_user` (profile URL slug), not the literal text `YOUR_HF_USERNAME`. Token must be **write** (classic) or fine-grained with **create repos** + **Spaces** for that account/org. |
 | **README / “Startup duration too large”** | The launcher only sets `title` + `sdk: docker` (no `startup_duration_timeout` — avoids HF’s `6h` cap errors). Re-run the launcher after updating the repo, or on the Space click **Files and versions** → **README.md** and remove any `startup_duration_timeout: 8h` left from an old run. |
-| Build timeout / killed | Shorter image build: pin fewer pip deps; in Space **Settings** some accounts can raise build/startup limits. Shorten training (`--episodes`, `--no_eval`). |
+| **Docker build failed** on `unsloth` git / `colab-new` | Use the **latest** `hf_train.py`: image is `pytorch/pytorch:2.4.0-cuda12.1-…` + **unsloth from PyPI** (no git, no `colab-new`). Re-run the launcher. If the build log shows a **pip** error, paste the last 30 lines. |
+| Build timeout / killed | Unsloth + deps in one `RUN` can take 10–20+ minutes; if HF still kills the build, we can move installs to `entrypoint.sh` (slower per run, faster image build). |
 | CUDA OOM | `--hardware a10g-small` or larger; lower `--batch_size`, `--max_new_tokens`, or use a smaller `--model`. |
 | Clone fails | Public repo: leave `GITHUB_TOKEN` unset. Private: pass `--github_token` and ensure Space secret is set. |
 | Empty adapter repo | Check **Logs** for tracebacks; confirm `HF_TOKEN` has **write** and `hf_push_outputs.py` ran. |

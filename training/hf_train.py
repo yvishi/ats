@@ -59,8 +59,10 @@ PUSH_SCRIPT = textwrap.dedent("""\
 
 
 def _dockerfile() -> str:
+    # HF Space Docker builds: avoid `unsloth[colab-new] @ git+...` (often fails: timeouts,
+    # Colab-only extras, long compile). Use official PyTorch image + unsloth from PyPI.
     return textwrap.dedent("""\
-        FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+        FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
 
         ENV DEBIAN_FRONTEND=noninteractive
         ENV PYTHONUNBUFFERED=1
@@ -68,18 +70,16 @@ def _dockerfile() -> str:
         ENV TOKENIZERS_PARALLELISM=false
         ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
-        RUN apt-get update && apt-get install -y \\
-            git curl python3.11 python3-pip \\
-            && ln -sf /usr/bin/python3.11 /usr/bin/python \\
-            && ln -sf /usr/bin/python3.11 /usr/bin/python3 \\
+        RUN apt-get update && apt-get install -y --no-install-recommends \\
+            git ca-certificates \\
             && rm -rf /var/lib/apt/lists/*
 
-        # Unsloth first (pulls compatible transformers stack).
-        RUN pip install --no-cache-dir "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-        RUN pip install --no-cache-dir \\
+        # Single pip layer: torch is in base image; unsloth from PyPI (not git).
+        RUN pip install --no-cache-dir --upgrade pip && \\
+            pip install --no-cache-dir \\
+            "unsloth>=2024.8" \\
             "trl>=0.9.6" "datasets>=2.20.0" "accelerate>=0.32.0" "peft>=0.12.0" "bitsandbytes>=0.43.0" \\
-            "huggingface_hub>=0.26" "hf_transfer" "matplotlib>=3.9.0" "numpy>=1.26.0"
-        RUN pip install --no-cache-dir \\
+            "huggingface_hub>=0.26" "hf_transfer" "matplotlib>=3.9.0" "numpy>=1.26.0" \\
             "openenv-core[core]>=0.2.3" "fastapi>=0.128.0" "openai>=2.30.0" "pydantic>=2.12.0" "uvicorn>=0.41.0"
 
         WORKDIR /app
