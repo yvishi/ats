@@ -1,3 +1,12 @@
+# ── Stage 1: Vite production bundle ──────────────────────────────────────────
+FROM node:22-bookworm-slim AS frontend
+WORKDIR /build
+COPY space_frontend/package.json ./
+RUN npm install --ignore-scripts
+COPY space_frontend/ ./
+RUN npm run build
+
+# ── Stage 2: API + static Space UI ───────────────────────────────────────────
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -17,18 +26,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md openenv.yaml /app/
-COPY uv.lock /app/
-COPY __init__.py client.py constants.py engine.py graders.py imports.py inference.py models.py planner.py tasks.py /app/
+COPY pyproject.toml uv.lock README.md openenv.yaml /app/
+COPY __init__.py constants.py client.py engine.py graders.py inference.py models.py planner.py tasks.py /app/
+COPY multi_agent /app/multi_agent
+COPY atc_env /app/atc_env
+COPY domains /app/domains
 COPY server /app/server
 COPY scripts /app/scripts
+COPY training /app/training
 
 RUN pip install --no-cache-dir uv \
     && uv sync --frozen --no-dev
 
+COPY --from=frontend /build/dist /app/space_frontend/dist
+
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,127 @@
+:root {
+  color-scheme: dark;
+  --bg: #0c1018;
+  --panel: #141c28;
+  --text: #e8eef8;
+  --muted: #7a8aa0;
+  --accent: #5ab0ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  font-family: "DM Sans", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.app-wrap {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 2rem;
+}
+
+h1 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0 0 0.35rem;
+  letter-spacing: -0.02em;
+}
+
+.sub {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin-bottom: 1rem;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: flex-end;
+  margin-bottom: 0.75rem;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+select,
+button {
+  font: inherit;
+  border-radius: 6px;
+  border: 1px solid #2a3544;
+  background: var(--panel);
+  color: var(--text);
+  padding: 0.4rem 0.55rem;
+}
+
+button.primary {
+  background: linear-gradient(180deg, #3a7abf, #2a6098);
+  border-color: #4a90d0;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button.primary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.canvas-shell {
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #243044;
+  background: #080c12;
+}
+
+.canvas-shell::after {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.12) 2px,
+    rgba(0, 0, 0, 0.12) 3px
+  );
+  opacity: 0.35;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.log {
+  margin-top: 0.65rem;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 0.68rem;
+  color: var(--muted);
+  max-height: 140px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.35;
+}

@@ -1,3 +1,5 @@
+node_modules/
+
 # Python caches and build artifacts
 __pycache__/
 .pytest_cache/

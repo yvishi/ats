@@ -51,4 +51,4 @@ atc-hf-train = "training.hf_train:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["atc_env*", "multi_agent*", "training*", "server*"]
+include = ["atc_env*", "multi_agent*", "domains*", "training*", "server*"]

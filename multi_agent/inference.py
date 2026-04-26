@@ -59,6 +59,13 @@ from multi_agent.models import (
     SUPERVISOR_PROFILES,
 )
 from multi_agent.supervisor import SupervisorAgent
+from multi_agent.visual_events import (
+    VisualSink,
+    emit,
+    serialize_action_layout,
+    serialize_task_snapshot,
+    terminal_event,
+)
 from training.dataset import (
     AMAN_SYSTEM,
     DMAN_SYSTEM,
@@ -397,6 +404,7 @@ def _negotiate_multi_pass(
     dman_obs_start: MultiAgentObservation,
     atfm: Dict[str, int],
     rounds: List[Dict[str, Any]],
+    visual_sink: VisualSink = None,
 ) -> Tuple[MultiAgentObservation, MultiAgentObservation]:
     """Up to MAX_NEGOTIATE_ROUNDS revision passes on separation conflicts.
 
@@ -449,6 +457,18 @@ def _negotiate_multi_pass(
         log_neg(neg_r, resolved, total_msgs)
         log_step(1 + neg_r, "NEGOTIATE", partial_r, sep_after, True)
 
+        emit(
+            visual_sink,
+            {
+                "type": "negotiation_tick",
+                "pass": neg_r,
+                "partial_reward": partial_r,
+                "separation_issues_after": sep_after,
+                "used_llm": use_llm,
+                "layout": serialize_action_layout(aman_action, dman_action),
+            },
+        )
+
         rounds.append({
             "round": "NEGOTIATE",
             "negotiate_pass": neg_r,
@@ -500,12 +520,16 @@ def run_episode(
     use_generator: bool = True,
     model_name: Optional[str] = None,
     transcript_dir: Optional[Path] = None,
+    visual_sink: VisualSink = None,
+    visual_profile: str = "atc",
 ) -> Dict:
     """Run one full AMAN/DMAN episode. Returns result dict for logging.
 
     Args:
         transcript_dir: If set, writes a JSON transcript of the full episode
             (actions, messages, rewards, metadata) to this directory.
+        visual_sink: Optional callback receiving visual event dicts (SSE / UI).
+        visual_profile: ``atc`` | ``icu`` — UI theme only (same simulation).
     """
     catalog  = task_catalog()
     base_task = catalog.get(task_id, list(catalog.values())[0])
@@ -538,16 +562,42 @@ def run_episode(
 
     # Accumulate round data for the transcript
     rounds: List[Dict[str, Any]] = []
+    visual_log: List[Dict[str, Any]] = []
+
+    def _v(ev: Dict[str, Any]) -> None:
+        visual_log.append(dict(ev))
+        emit(visual_sink, ev)
+
+    assert env._state.task is not None
+    _v(
+        {
+            "type": "scene_reset",
+            "episode_id": episode_id,
+            "task_id": task_id,
+            "resolved_task_id": env._state.task.task_id,
+            "visual_profile": visual_profile,
+            "supervisor_profile": profile.value,
+            "mutations_applied": mutations_applied,
+            "task": serialize_task_snapshot(env._state.task),
+        },
+    )
 
     # ── Round 0: BID ──────────────────────────────────────────────────────────
+    _v({"type": "llm_started", "role": "AMAN", "model": selected_model})
     aman_action = (
         _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
         or _build_aman_heuristic(aman_obs)
     )
+    _v({"type": "llm_finished", "role": "AMAN", "used_llm": client is not None})
+
+    _v({"type": "llm_started", "role": "DMAN", "model": selected_model})
     dman_action = (
         _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
         or _build_dman_heuristic(dman_obs, atfm)
     )
+    _v({"type": "llm_finished", "role": "DMAN", "used_llm": client is not None})
+
+    _v({"type": "action_layout", "phase": "BID", "layout": serialize_action_layout(aman_action, dman_action)})
 
     aman_obs2, dman_obs2, partial_r, done = env.step_bid(aman_action, dman_action)
     n_sep_after_bid = count_separation_issues(env._state.conflict_log)
@@ -577,6 +627,7 @@ def run_episode(
             dman_obs2,
             atfm,
             rounds,
+            visual_sink=lambda ev: _v(ev),
         )
 
     # ── Finalize ──────────────────────────────────────────────────────────────
@@ -600,6 +651,26 @@ def run_episode(
         "solvable":       solvable,
     }
 
+    _v(
+        {
+            "type": "score_update",
+            "composite": result.composite_score,
+            "aman_reward": result.aman_reward,
+            "dman_reward": result.dman_reward,
+        },
+    )
+    _v(
+        terminal_event(
+            composite=result.composite_score,
+            aman_reward=result.aman_reward,
+            dman_reward=result.dman_reward,
+            coordination=result.per_role.coordination_score,
+            cross_lane_conflicts=result.per_role.cross_lane_conflicts,
+            atfm_violations=result.per_role.atfm_violations,
+            negotiation_rounds=result.negotiation_rounds,
+        )
+    )
+
     if transcript_dir is not None:
         _save_transcript(
             transcript_dir,
@@ -611,6 +682,7 @@ def run_episode(
                 "gen_difficulty":    gen_difficulty,
                 "mutations_applied": mutations_applied,
                 "solvable":          solvable,
+                "visual_log":        visual_log,
                 "rounds":            rounds,
                 "final": {
                     "composite_score":    result.composite_score,
@@ -638,6 +710,8 @@ def run_domain_episode(
     episode_id: int,
     model_name: Optional[str] = None,
     transcript_dir: Optional[Path] = None,
+    visual_sink: VisualSink = None,
+    visual_profile: str = "icu",
 ) -> Dict:
     """Run one ADAPT domain-transfer episode.
 
@@ -667,12 +741,26 @@ def run_domain_episode(
     profile     = supervisor.sample_profile(episode_id)
     sup_desc    = SUPERVISOR_PROFILES[profile]["description"]
     rounds: List[Dict[str, Any]] = []
+    visual_log: List[Dict[str, Any]] = []
+
+    def _v(ev: Dict[str, Any]) -> None:
+        visual_log.append(dict(ev))
+        emit(visual_sink, ev)
 
     # ── ADAPT step ────────────────────────────────────────────────────────────
     adapt_obs = build_adapt_observation(task=domain_task, profile=profile)
 
     adapt_action: Optional[object] = None
     adapt_rationale = "(heuristic)"
+
+    _v(
+        {
+            "type": "adapt_scene",
+            "domain_task_id": domain_task_id,
+            "visual_profile": visual_profile,
+            "entity_types": list(adapt_obs.entity_types),
+        },
+    )
 
     if client is not None:
         try:
@@ -695,6 +783,15 @@ def run_domain_episode(
         adapt_action   = _build_adapt_heuristic(adapt_obs, domain_task)
         adapt_rationale = adapt_action.rationale
 
+    _v(
+        {
+            "type": "adapt_mapping",
+            "wake_map": dict(adapt_action.entity_wake_map),
+            "priority_map": dict(adapt_action.entity_priority_map),
+            "rationale_preview": (adapt_rationale or "")[:200],
+        },
+    )
+
     _p(f"[ADAPT] domain={domain_task_id} entities={adapt_obs.entity_types}")
     _p(f"[ADAPT] wake_map={adapt_action.entity_wake_map}")
     _p(f"[ADAPT] priority_map={adapt_action.entity_priority_map}")
@@ -712,6 +809,21 @@ def run_domain_episode(
     atfm = env._state.atfm_deadlines
     selected_model = model_name or MODEL_NAME
 
+    assert env._state.task is not None
+    _v(
+        {
+            "type": "scene_reset",
+            "episode_id": episode_id,
+            "task_id": domain_task_id,
+            "resolved_task_id": env._state.task.task_id,
+            "visual_profile": visual_profile,
+            "supervisor_profile": profile.value,
+            "mutations_applied": [],
+            "task": serialize_task_snapshot(env._state.task),
+        },
+    )
+
+    _v({"type": "llm_started", "role": "AMAN", "model": selected_model})
     aman_action = _build_aman_heuristic(aman_obs)
     dman_action = _build_dman_heuristic(dman_obs, atfm)
     if client is not None:
@@ -719,10 +831,17 @@ def run_domain_episode(
             _llm_action(client, selected_model, AMAN_SYSTEM, aman_obs, sup_desc, AgentRole.AMAN)
             or aman_action
         )
+    _v({"type": "llm_finished", "role": "AMAN", "used_llm": client is not None})
+
+    _v({"type": "llm_started", "role": "DMAN", "model": selected_model})
+    if client is not None:
         dman_action = (
             _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
             or dman_action
         )
+    _v({"type": "llm_finished", "role": "DMAN", "used_llm": client is not None})
+
+    _v({"type": "action_layout", "phase": "BID", "layout": serialize_action_layout(aman_action, dman_action)})
 
     aman_obs2, dman_obs2, partial_r, done = env.step_bid(aman_action, dman_action)
     n_sep_after_bid = count_separation_issues(env._state.conflict_log)
@@ -751,9 +870,30 @@ def run_domain_episode(
             dman_obs2,
             atfm,
             rounds,
+            visual_sink=lambda ev: _v(ev),
         )
 
     result = env.finalize()
+
+    _v(
+        {
+            "type": "score_update",
+            "composite": result.composite_score,
+            "aman_reward": result.aman_reward,
+            "dman_reward": result.dman_reward,
+        },
+    )
+    _v(
+        terminal_event(
+            composite=result.composite_score,
+            aman_reward=result.aman_reward,
+            dman_reward=result.dman_reward,
+            coordination=result.per_role.coordination_score,
+            cross_lane_conflicts=result.per_role.cross_lane_conflicts,
+            atfm_violations=result.per_role.atfm_violations,
+            negotiation_rounds=result.negotiation_rounds,
+        )
+    )
 
     episode_result: Dict[str, Any] = {
         "domain_task_id":  domain_task_id,
@@ -780,6 +920,7 @@ def run_domain_episode(
                 "adapt_wake_map":     adapt_action.entity_wake_map,
                 "adapt_priority_map": adapt_action.entity_priority_map,
                 "adapt_rationale":    adapt_rationale,
+                "visual_log":         visual_log,
                 "rounds":             rounds,
                 "final": {
                     "composite_score":    result.composite_score,
@@ -788,6 +929,7 @@ def run_domain_episode(
                     "coordination_score": result.per_role.coordination_score,
                     "cross_lane_conflicts": result.per_role.cross_lane_conflicts,
                     "negotiation_rounds": result.negotiation_rounds,
+                    "atfm_violations":    result.per_role.atfm_violations,
                 },
             },
         )

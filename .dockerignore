@@ -6,3 +6,7 @@ __pycache__
 tests
 .codex
 .github
+reference
+node_modules
+space_frontend/node_modules
+space_frontend/dist
