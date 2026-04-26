@@ -1,18 +1,24 @@
 ---
-title: ATC Optimization OpenEnv
+title: AirX
+emoji: ✈️
+colorFrom: blue
+colorTo: cyan
 sdk: docker
 app_port: 8000
 license: mit
+pinned: true
 tags:
   - openenv
   - multi-agent
   - grpo
   - air-traffic-control
   - rlve
-  - cooperative-competitive
+  - cooperative-cooperative
   - self-play
   - domain-transfer
   - adapt
+  - icu
+  - reinforcement-learning
 ---
 
 ![OpenEnv](https://img.shields.io/badge/OpenEnv-compatible-blue)

@@ -137,9 +137,13 @@ def main() -> int:
         raise SystemExit(f"Repo directory not found: {repo_dir}")
 
     api = HfApi(token=args.token)
-    who = api.whoami()
-    actor = who.get("name") or who.get("fullname") or "unknown"
-    print(f"[OK] Authenticated to Hugging Face as: {actor}")
+    try:
+        who = api.whoami(cache=True)
+        actor = who.get("name") or who.get("fullname") or "unknown"
+        print(f"[OK] Authenticated to Hugging Face as: {actor}")
+    except Exception:
+        # Whoami rate-limited; proceed anyway — the token will be validated on next API call.
+        print("[WARN] Could not verify token via whoami (rate-limited). Proceeding...")
 
     api.create_repo(
         repo_id=space_id,
@@ -156,12 +160,21 @@ def main() -> int:
         ".pytest_cache",
         "__pycache__",
         "*.pyc",
+        "*.pyo",
         ".env",
         ".env.*",
         "*.env",
         "*.env.*",
         ".codex",
         ".github",
+        "node_modules",
+        ".uv-cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "*.egg-info",
+        "wandb",
+        "outputs",
+        "unsloth_compiled_cache",
     ]
 
     commit_info = api.upload_folder(

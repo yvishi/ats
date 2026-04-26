@@ -37,25 +37,25 @@ function useDemoTasks() {
 }
 
 export default function App() {
-  const canvasRef   = useRef<HTMLCanvasElement>(null);
-  const engineRef   = useRef<PixelEngine | null>(null);
-  const esRef       = useRef<EventSource | null>(null);
-  const logIdRef    = useRef(0);
-  const histIdRef   = useRef(0);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const engineRef = useRef<PixelEngine | null>(null);
+  const esRef = useRef<EventSource | null>(null);
+  const logIdRef = useRef(0);
+  const histIdRef = useRef(0);
 
   const { tasks, err: tasksErr } = useDemoTasks();
 
-  const [filter, setFilter]               = useState<FilterMode>("all");
-  const [adaptActive, setAdaptActive]     = useState(false);
-  const [selectedTask, setSelectedTask]   = useState<DemoTask | null>(null);
-  const [running, setRunning]             = useState(false);
-  const [score, setScore]                 = useState<ScoreState>(EMPTY_SCORE);
-  const [logEntries, setLogEntries]       = useState<LogEntry[]>([]);
+  const [filter, setFilter] = useState<FilterMode>("all");
+  const [adaptActive, setAdaptActive] = useState(false);
+  const [selectedTask, setSelectedTask] = useState<DemoTask | null>(null);
+  const [running, setRunning] = useState(false);
+  const [score, setScore] = useState<ScoreState>(EMPTY_SCORE);
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [agentThinking, setAgentThinking] = useState<"AMAN" | "DMAN" | null>(null);
-  const [useLlm, setUseLlm]               = useState(false);
-  const [modelName, setModelName]         = useState(PRESET_MODELS[0]);
-  const [episodeId, setEpisodeId]         = useState(0);
-  const [runHistory, setRunHistory]       = useState<RunResult[]>([]);
+  const [useLlm, setUseLlm] = useState(false);
+  const [modelName, setModelName] = useState(PRESET_MODELS[0]);
+  const [episodeId, setEpisodeId] = useState(0);
+  const [runHistory, setRunHistory] = useState<RunResult[]>([]);
   const [activeStreamUrl, setActiveStreamUrl] = useState("");
 
   /* Init PixelEngine */
@@ -121,12 +121,12 @@ export default function App() {
 
     const vProfile = selectedTask.mode === "domain" ? "icu" : "atc";
     const u = new URL("/demo/episode/stream", window.location.origin);
-    u.searchParams.set("task_id",        selectedTask.task_id);
-    u.searchParams.set("mode",           selectedTask.mode);
+    u.searchParams.set("task_id", selectedTask.task_id);
+    u.searchParams.set("mode", selectedTask.mode);
     u.searchParams.set("visual_profile", vProfile);
-    u.searchParams.set("episode_id",     String(episodeId));
-    u.searchParams.set("use_generator",  "true");
-    u.searchParams.set("use_llm",        useLlm ? "true" : "false");
+    u.searchParams.set("episode_id", String(episodeId));
+    u.searchParams.set("use_generator", "true");
+    u.searchParams.set("use_llm", useLlm ? "true" : "false");
     if (useLlm && modelName) u.searchParams.set("model", modelName);
 
     const urlStr = u.toString();
@@ -152,22 +152,22 @@ export default function App() {
         setAgentThinking(null);
       } else if (t === "score_update") {
         const update: Partial<ScoreState> = {
-          composite:   Number(ev.composite   ?? 0),
-          aman_reward: Number(ev.aman_reward  ?? 0),
-          dman_reward: Number(ev.dman_reward  ?? 0),
+          composite: Number(ev.composite ?? 0),
+          aman_reward: Number(ev.aman_reward ?? 0),
+          dman_reward: Number(ev.dman_reward ?? 0),
         };
         Object.assign(latestScore, update);
         setScore((prev) => ({ ...prev, ...update }));
       } else if (t === "terminal") {
         const sev = String(ev.severity ?? "") as ScoreState["severity"];
         const final: ScoreState = {
-          composite:            Number(ev.composite            ?? latestScore.composite    ?? 0),
-          aman_reward:          Number(ev.aman_reward           ?? latestScore.aman_reward  ?? 0),
-          dman_reward:          Number(ev.dman_reward           ?? latestScore.dman_reward  ?? 0),
-          coordination:         Number(ev.coordination          ?? 0),
-          cross_lane_conflicts: Number(ev.cross_lane_conflicts  ?? 0),
-          atfm_violations:      Number(ev.atfm_violations       ?? 0),
-          negotiation_rounds:   Number(ev.negotiation_rounds    ?? 0),
+          composite: Number(ev.composite ?? latestScore.composite ?? 0),
+          aman_reward: Number(ev.aman_reward ?? latestScore.aman_reward ?? 0),
+          dman_reward: Number(ev.dman_reward ?? latestScore.dman_reward ?? 0),
+          coordination: Number(ev.coordination ?? 0),
+          cross_lane_conflicts: Number(ev.cross_lane_conflicts ?? 0),
+          atfm_violations: Number(ev.atfm_violations ?? 0),
+          negotiation_rounds: Number(ev.negotiation_rounds ?? 0),
           severity: sev,
           done: true,
         };
@@ -175,15 +175,15 @@ export default function App() {
         setRunHistory((prev) => [
           ...prev.slice(-19),
           {
-            id:          histIdRef.current++,
-            taskLabel:   selectedTask.label,
-            taskId:      selectedTask.task_id,
-            domain:      selectedTask.mode,
+            id: histIdRef.current++,
+            taskLabel: selectedTask.label,
+            taskId: selectedTask.task_id,
+            domain: selectedTask.mode,
             episodeId,
-            composite:   final.composite,
+            composite: final.composite,
             aman_reward: final.aman_reward,
             dman_reward: final.dman_reward,
-            severity:    sev ?? "",
+            severity: sev ?? "",
             usedLlm: useLlm,
             ts: Date.now(),
           },
@@ -195,14 +195,14 @@ export default function App() {
 
       let detail = "";
       switch (t) {
-        case "score_update":     detail = `cmp=${Number(ev.composite ?? 0).toFixed(3)}  aman=${Number(ev.aman_reward ?? 0).toFixed(3)}  dman=${Number(ev.dman_reward ?? 0).toFixed(3)}`; break;
-        case "terminal":         detail = `${ev.severity}  cmp=${Number(ev.composite ?? 0).toFixed(3)}`; break;
-        case "scene_reset":      detail = String(ev.task_id ?? ""); break;
-        case "llm_started":      detail = String(ev.role ?? ""); break;
+        case "score_update": detail = `cmp=${Number(ev.composite ?? 0).toFixed(3)}  aman=${Number(ev.aman_reward ?? 0).toFixed(3)}  dman=${Number(ev.dman_reward ?? 0).toFixed(3)}`; break;
+        case "terminal": detail = `${ev.severity}  cmp=${Number(ev.composite ?? 0).toFixed(3)}`; break;
+        case "scene_reset": detail = String(ev.task_id ?? ""); break;
+        case "llm_started": detail = String(ev.role ?? ""); break;
         case "negotiation_tick": detail = `pass ${ev.pass ?? 0}`; break;
-        case "action_layout":    detail = `arr=${(ev as {layout?: {aman_arrivals?: unknown[]}}).layout?.aman_arrivals?.length ?? 0}  dep=${(ev as {layout?: {dman_departures?: unknown[]}}).layout?.dman_departures?.length ?? 0}`; break;
-        case "error":            detail = String(ev.detail ?? ""); break;
-        case "adapt_mapping":    detail = String(ev.rationale_preview ?? "").slice(0, 55); break;
+        case "action_layout": detail = `arr=${(ev as { layout?: { aman_arrivals?: unknown[] } }).layout?.aman_arrivals?.length ?? 0}  dep=${(ev as { layout?: { dman_departures?: unknown[] } }).layout?.dman_departures?.length ?? 0}`; break;
+        case "error": detail = String(ev.detail ?? ""); break;
+        case "adapt_mapping": detail = String(ev.rationale_preview ?? "").slice(0, 55); break;
         default: break;
       }
       if (t !== "negotiation_tick") pushLog(t, detail);
@@ -237,8 +237,8 @@ export default function App() {
         <div className="header-brand">
           <div className="brand-glyph">◈</div>
           <div className="brand-text">
-            <span className="brand-main">ADAPT</span>
-            <span className="brand-sub">ATC Multi-Agent · GRPO RL</span>
+            <span className="brand-main">AirX</span>
+            <span className="brand-sub">Self Improving & Adapting Multi-Agent Environment</span>
           </div>
         </div>
 
@@ -335,12 +335,11 @@ export default function App() {
                         {sortedDiffs.map((d) => (
                           <span
                             key={d}
-                            className={`td-diff-step ${
-                              (DIFFICULTY_ORDER[d] ?? 0) <=
+                            className={`td-diff-step ${(DIFFICULTY_ORDER[d] ?? 0) <=
                               (DIFFICULTY_ORDER[selectedTask.difficulty ?? ""] ?? 0)
-                                ? "active"
-                                : ""
-                            }`}
+                              ? "active"
+                              : ""
+                              }`}
                             title={d}
                           />
                         ))}
