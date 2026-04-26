@@ -239,6 +239,7 @@ def build_episode_dataset(
     include_supervisor: bool = True,
     include_adapt: bool = True,
     domain_episode_ratio: float = 0.30,
+    domain_stratify: bool = True,
 ) -> List[Dict[str, Any]]:
     """Build full multi-agent training dataset.
 
@@ -256,14 +257,30 @@ def build_episode_dataset(
 
     samples: List[Dict[str, Any]] = []
 
+    domain_tasks_for_stratify: Optional[Dict[str, Any]] = None
+    domain_id_list: List[str] = []
+    domain_idx = 0
+    if include_adapt and domain_stratify:
+        try:
+            from domains import get_all_domain_tasks
+            domain_tasks_for_stratify = get_all_domain_tasks()
+            if domain_tasks_for_stratify:
+                domain_id_list = sorted(domain_tasks_for_stratify.keys())
+        except Exception:
+            domain_id_list = []
+
     for ep_id in range(n_episodes):
         # ── ADAPT Domain Sample (Stochastic) ──────────────────────────────────
         if include_adapt and rng.random() < domain_episode_ratio:
             from domains import get_all_domain_tasks
             from multi_agent.adapt import build_adapt_observation
-            domain_tasks = get_all_domain_tasks()
+            domain_tasks = domain_tasks_for_stratify or get_all_domain_tasks()
             if domain_tasks:
-                tid = rng.choice(list(domain_tasks.keys()))
+                if domain_stratify and domain_id_list:
+                    tid = domain_id_list[domain_idx % len(domain_id_list)]
+                    domain_idx += 1
+                else:
+                    tid = rng.choice(list(domain_tasks.keys()))
                 dtask = domain_tasks[tid]
                 profile = supervisor.sample_profile(ep_id)
                 obs = build_adapt_observation(dtask, profile)

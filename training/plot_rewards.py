@@ -53,8 +53,14 @@ def plot_training_curves(
         "figure.dpi": 150,
     })
 
-    roles   = ["AMAN", "DMAN", "GENERATOR", "SUPERVISOR"]
-    colours = {"AMAN": "#1976D2", "DMAN": "#F57C00", "GENERATOR": "#C62828", "SUPERVISOR": "#2E7D32"}
+    roles   = ["AMAN", "DMAN", "ADAPT", "GENERATOR", "SUPERVISOR"]
+    colours = {
+        "AMAN": "#1976D2",
+        "DMAN": "#F57C00",
+        "ADAPT": "#6A1B9A",
+        "GENERATOR": "#C62828",
+        "SUPERVISOR": "#2E7D32",
+    }
 
     fig = plt.figure(figsize=(16, 10))
     fig.suptitle("Multi-Agent ATC — GRPO Training Curves", fontsize=15, fontweight="bold", y=0.98)
@@ -172,6 +178,7 @@ def plot_eval_comparison(eval_results: Dict, save_dir: Optional[str] = None, sho
         ("Composite Score",    "mean_composite",    "mean_composite"),
         ("AMAN Reward",        "mean_aman",         "mean_aman_reward"),
         ("DMAN Reward",        "mean_dman",         "mean_dman_reward"),
+        ("ADAPT pipeline",     "mean_adapt",        "mean_adapt"),
         ("Coordination Score", "mean_coord",        "mean_coordination"),
         ("Success Rate",       "success_rate",      "success_rate"),
     ]
@@ -188,7 +195,7 @@ def plot_eval_comparison(eval_results: Dict, save_dir: Optional[str] = None, sho
 
     x   = list(range(len(labels)))
     w   = 0.35
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
 
     ax.bar([i - w/2 for i in x], base_v,  w, label="Base (untrained)", color="#90A4AE", alpha=0.85)
     bars2 = ax.bar([i + w/2 for i in x], train_v, w, label="Trained (GRPO)", color="#1565C0", alpha=0.90)
