@@ -47,6 +47,7 @@ atc-train-sft = "training.train_sft:main"
 atc-build-sft-data = "training.build_sft_dataset:main"
 atc-eval = "training.eval:main"
 atc-plot = "training.plot_rewards:main"
+atc-hf-train = "training.hf_train:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

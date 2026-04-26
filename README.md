@@ -561,6 +561,10 @@ Open `training/atc_multiagent_colab.ipynb` in Google Colab. Single cell installs
 
 For **SFT (JSON) → GRPO** on medium-tier / negotiation-focused runs, use `training/atc_colab_sft_grpo_medium.ipynb` (Drive paths, optional SFT phase, then GRPO + eval + plots).
 
+### Hugging Face Spaces (GPU)
+
+To train on HF-managed GPU (Space Docker + Hub upload), use **`training/hf_train.py`** and follow **`training/HF_TRAINING.md`**.
+
 ### Evaluate a Trained Checkpoint
 
 ```bash
