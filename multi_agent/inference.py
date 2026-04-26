@@ -129,6 +129,78 @@ def log_end(
     )
 
 
+# ── Cross-role spacing (ICU / high-capacity resources) ─────────────────────────
+#
+# simulate_plan() enforces max(capacity_floor, wake) between *any* consecutive ops on a
+# runway. ICU beds used hourly_capacity=4 → 15 min floor, while heuristics historically
+# avoided peer claims by only ~3 min — guaranteed cross-lane conflicts and ruined scores.
+
+
+def _resolve_peer_clearance(
+    t: int,
+    peer_minutes: List[int],
+    cap_gap: int,
+    my_wake: str,
+    latest_limit: int,
+    repair: int,
+    peer_wake_default: str = "M",
+) -> Optional[int]:
+    """Push minute ``t`` forward until it clears peer slot minutes on the same runway.
+
+    Uses runway capacity floor and wake separation (peer wake defaulted to Medium).
+    Returns None if no feasible minute ≤ ``latest_limit``.
+    """
+    from constants import SEPARATION_BY_WAKE
+
+    after_peer = max(
+        cap_gap,
+        SEPARATION_BY_WAKE.get((peer_wake_default, my_wake), 4),
+    ) + max(0, repair)
+    before_peer = max(
+        cap_gap,
+        SEPARATION_BY_WAKE.get((my_wake, peer_wake_default), 4),
+    ) + max(0, repair)
+    e = t
+    peers = sorted({int(x) for x in peer_minutes})
+    for _ in range(600):
+        moved = False
+        for pm in peers:
+            if e >= pm and e < pm + after_peer:
+                e = pm + after_peer
+                moved = True
+            elif e < pm and (pm - e) < before_peer:
+                e = pm + after_peer
+                moved = True
+        if not moved:
+            break
+        if e > latest_limit:
+            return None
+    return e
+
+
+def _dman_obs_with_aman_messages(
+    dman_obs: MultiAgentObservation,
+    aman_action: AMANAction,
+) -> MultiAgentObservation:
+    """Update DMAN's inbox with AMAN's CURRENT slot claims, replacing any stale ones.
+
+    Old deduplicate-by-(runway,minute,flight) logic accumulated superseded AMAN
+    messages: if AMAN moved flight X from BED_A@0 to BED_A@5, DMAN would see both
+    claims and over-block BED_A.  Instead, drop any prior AMAN message whose
+    flight_id appears in the new outgoing set, then append the fresh claims.
+    """
+    if not aman_action.outgoing_messages:
+        return dman_obs
+    refreshed_fids = {m.flight_id for m in aman_action.outgoing_messages}
+    kept = [
+        m for m in dman_obs.incoming_messages
+        if not (m.from_role == AgentRole.AMAN and m.flight_id in refreshed_fids)
+    ]
+    return dman_obs.model_copy(
+        update={"incoming_messages": kept + list(aman_action.outgoing_messages)},
+    )
+
+
 # ── Heuristic AMAN planner ────────────────────────────────────────────────────
 
 def _build_aman_heuristic(
@@ -150,13 +222,6 @@ def _build_aman_heuristic(
     slots: List[SlotAssignment] = []
     emergency_yields: List[str] = []
 
-    # Check for DMAN emergency broadcasts — yield slots around those minutes
-    dman_emg_slots: List[Tuple[str, int]] = [
-        (m.runway_id, m.requested_minute)
-        for m in obs.incoming_messages
-        if m.is_emergency and m.from_role == AgentRole.DMAN
-    ]
-
     for flight in arrivals:
         best_rwy, best_min = None, None
         best_gap = -1
@@ -175,28 +240,51 @@ def _build_aman_heuristic(
                 (last_wake, flight.wake_class.value), 3
             )
             min_gap = max(cap_gap, wake_gap) + repair
-            earliest = max(flight.earliest_minute, last_min + min_gap)
+            earliest_cap = max(flight.earliest_minute, last_min + min_gap)
 
-            if earliest > flight.latest_minute:
+            if earliest_cap > flight.latest_minute:
                 continue
 
-            em_buf = 3 + max(1, repair)
-            bump = 3 + max(1, repair)
-            # Avoid DMAN emergency slots (±em_buf min)
-            blocked = any(
-                rwy_id == er and abs(earliest - et) < em_buf
-                for er, et in dman_emg_slots
+            # Prefer to schedule at the flight's scheduled_minute rather than the
+            # earliest capacity gap.  Busy ATC runways naturally put earliest_cap
+            # near scheduled; idle ICU beds start at T+5 and would otherwise assign
+            # all flights minutes before their time, destroying delay_efficiency.
+            target = max(earliest_cap, flight.scheduled_minute)
+            if target > flight.latest_minute:
+                target = earliest_cap  # scheduled falls outside window; use earliest
+
+            dman_peer = [
+                m.requested_minute
+                for m in obs.incoming_messages
+                if m.from_role == AgentRole.DMAN and m.runway_id == rwy_id
+            ]
+
+            # Peer-clear from target; fall back to earliest_cap if target can't clear
+            before_peer = target
+            slot = _resolve_peer_clearance(
+                target, dman_peer, cap_gap, flight.wake_class.value,
+                flight.latest_minute, repair,
             )
-            if blocked:
-                earliest = min(flight.latest_minute, earliest + bump)
-                if earliest > flight.latest_minute:
+            if slot is None:
+                before_peer = earliest_cap
+                slot = _resolve_peer_clearance(
+                    earliest_cap, dman_peer, cap_gap, flight.wake_class.value,
+                    flight.latest_minute, repair,
+                )
+                if slot is None:
                     continue
+
+            if slot > before_peer and any(
+                m.is_emergency
+                for m in obs.incoming_messages
+                if m.from_role == AgentRole.DMAN and m.runway_id == rwy_id
+            ):
                 emergency_yields.append(flight.flight_id)
 
-            gap_to_scheduled = abs(earliest - flight.scheduled_minute)
+            gap_to_scheduled = abs(slot - flight.scheduled_minute)
             if best_rwy is None or gap_to_scheduled < best_gap:
                 best_rwy = rwy_id
-                best_min = earliest
+                best_min = slot
                 best_gap = gap_to_scheduled
 
         if best_rwy and best_min is not None:
@@ -296,7 +384,14 @@ def _build_dman_heuristic(
     messages: List[NegotiationMessage] = []
 
     for flight in departures:
+        # Only pure EMERGENCY flights override AMAN's claims entirely.
+        # MEDICAL departures (e.g. ICU POST_OP after ADAPT) must still attempt
+        # peer-clearance: they have hard transfer-auth deadlines and compete for
+        # the same beds as AMAN admissions.  Skipping clearance for MEDICAL was
+        # the root cause of permanent BID-phase conflicts that negotiation could
+        # never resolve (DMAN re-claimed the same bed minute every pass).
         is_emg = flight.priority in (PriorityClass.EMERGENCY, PriorityClass.MEDICAL)
+        is_hard_emergency = flight.priority == PriorityClass.EMERGENCY
         deadline = atfm_deadlines.get(flight.flight_id)
         best_rwy, best_min = None, None
         best_score = float("inf")
@@ -312,28 +407,52 @@ def _build_dman_heuristic(
             cap_gap  = _capacity_spacing(rwy)
             wake_gap = SEPARATION_BY_WAKE.get((last_wake, flight.wake_class.value), 3)
             min_gap  = max(cap_gap, wake_gap) + repair
-            earliest = max(flight.earliest_minute, last_min + min_gap)
+            earliest_cap = max(flight.earliest_minute, last_min + min_gap)
 
-            if earliest > flight.latest_minute:
+            if earliest_cap > flight.latest_minute:
                 continue
 
-            claim_buf = 3 + max(1, repair)
-            # Avoid AMAN-claimed slots (±claim_buf min) unless this is an emergency
-            if not is_emg:
+            # Target scheduled time; avoids pulling departures to T+5 on idle resources.
+            # For ATFM-constrained flights, never target past the hard deadline.
+            target = max(earliest_cap, flight.scheduled_minute)
+            if target > flight.latest_minute:
+                target = earliest_cap
+            if deadline is not None and target > deadline:
+                target = earliest_cap  # must hit deadline; use earliest feasible
+
+            # Peer-clearance: EMERGENCY overrides AMAN; MEDICAL tries to clear then
+            # keeps best target if impossible; normal/connection skips runway.
+            if not is_hard_emergency:
                 aman_mins = aman_claims.get(rwy_id, [])
-                while any(abs(earliest - am) < claim_buf for am in aman_mins):
-                    earliest += 1
-                if earliest > flight.latest_minute:
-                    continue
+                # Try peer-clear from target first
+                cleared = _resolve_peer_clearance(
+                    target, aman_mins, cap_gap, flight.wake_class.value,
+                    flight.latest_minute, repair,
+                )
+                if cleared is not None:
+                    target = cleared
+                elif not is_emg:
+                    # Fall back to earliest_cap and retry
+                    cleared = _resolve_peer_clearance(
+                        earliest_cap, aman_mins, cap_gap, flight.wake_class.value,
+                        flight.latest_minute, repair,
+                    )
+                    if cleared is None:
+                        continue
+                    target = cleared
+                # MEDICAL with unresolvable conflict keeps target (negotiation resolves)
 
-            # ATFM deadline constraint
-            if deadline is not None and earliest > deadline:
+            if target > flight.latest_minute:
                 continue
 
-            score = abs(earliest - flight.scheduled_minute)
+            # ATFM deadline must still hold after peer clearance
+            if deadline is not None and target > deadline:
+                continue
+
+            score = abs(target - flight.scheduled_minute)
             if score < best_score:
                 best_rwy  = rwy_id
-                best_min  = earliest
+                best_min  = target
                 best_score = score
 
         if best_rwy and best_min is not None:
@@ -462,23 +581,25 @@ def _negotiate_multi_pass(
                 )
                 or _build_aman_heuristic(aman_cur)
             )
+            dman_merged = _dman_obs_with_aman_messages(dman_cur, aman_action)
             dman_action = (
                 _llm_action(
                     client,
                     selected_model,
                     DMAN_SYSTEM,
-                    dman_cur,
+                    dman_merged,
                     sup_desc,
                     AgentRole.DMAN,
                     temperature=0.2,
                     system_extra=llm_system_extra,
                 )
-                or _build_dman_heuristic(dman_cur, atfm)
+                or _build_dman_heuristic(dman_merged, atfm)
             )
         else:
             repair = 0 if neg_r == 1 else min(neg_r - 1, 3)
             aman_action = _build_aman_heuristic(aman_cur, separation_repair=repair)
-            dman_action = _build_dman_heuristic(dman_cur, atfm, separation_repair=repair)
+            dman_merged = _dman_obs_with_aman_messages(dman_cur, aman_action)
+            dman_action = _build_dman_heuristic(dman_merged, atfm, separation_repair=repair)
 
         aman_cur, dman_cur, partial_r, _ = env.step_negotiate(aman_action, dman_action)
         sep_after = count_separation_issues(env._state.conflict_log)
@@ -620,10 +741,11 @@ def run_episode(
     )
     _v({"type": "llm_finished", "role": "AMAN", "used_llm": client is not None})
 
+    dman_obs_bid = _dman_obs_with_aman_messages(dman_obs, aman_action)
     _v({"type": "llm_started", "role": "DMAN", "model": selected_model})
     dman_action = (
-        _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs, sup_desc, AgentRole.DMAN)
-        or _build_dman_heuristic(dman_obs, atfm)
+        _llm_action(client, selected_model, DMAN_SYSTEM, dman_obs_bid, sup_desc, AgentRole.DMAN)
+        or _build_dman_heuristic(dman_obs_bid, atfm)
     )
     _v({"type": "llm_finished", "role": "DMAN", "used_llm": client is not None})
 
@@ -835,6 +957,7 @@ def run_domain_episode(
         episode_id=episode_id,
         supervisor_profile=profile,
         mutated_task=mapped_task,
+        domain_mode=True,  # enables DOMAIN_MAX_NEGOTIATE_ROUNDS and correct steps_remaining
     )
     atfm = env._state.atfm_deadlines
     selected_model = model_name or MODEL_NAME
@@ -855,7 +978,6 @@ def run_domain_episode(
 
     _v({"type": "llm_started", "role": "AMAN", "model": selected_model})
     aman_action = _build_aman_heuristic(aman_obs)
-    dman_action = _build_dman_heuristic(dman_obs, atfm)
     if client is not None:
         aman_action = (
             _llm_action(
@@ -871,14 +993,16 @@ def run_domain_episode(
         )
     _v({"type": "llm_finished", "role": "AMAN", "used_llm": client is not None})
 
+    dman_obs_bid = _dman_obs_with_aman_messages(dman_obs, aman_action)
     _v({"type": "llm_started", "role": "DMAN", "model": selected_model})
+    dman_action = _build_dman_heuristic(dman_obs_bid, atfm)
     if client is not None:
         dman_action = (
             _llm_action(
                 client,
                 selected_model,
                 DMAN_SYSTEM,
-                dman_obs,
+                dman_obs_bid,
                 sup_desc,
                 AgentRole.DMAN,
                 system_extra=_DOMAIN_TRANSFER_LLM_HINT,

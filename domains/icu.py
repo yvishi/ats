@@ -70,10 +70,13 @@ Coordination challenge: The Admission Coordinator does not know which beds are
 
 _BEDS = ["BED_A", "BED_B", "BED_C", "BED_D"]
 
+# Spacing floor = max(2, round(60/hourly_capacity)) minutes between ops on the same bed.
+# 4/hr → 15 min, which made ICU scenarios nearly unsolvable vs heuristics tuned for airport
+# runways (~3–4 min). 12/hr → 5 min: still models turn-over delay without guaranteed conflicts.
 _BED_SPECS = [
     RunwaySpec(
         runway_id=bid,
-        hourly_capacity=4,   # max 4 patient changeovers per bed per hour
+        hourly_capacity=12,
         weather_penalty=1.0,
         notes="ICU bed — admission and discharge both allowed",
     )

@@ -16,6 +16,7 @@ Key design principles:
 from __future__ import annotations
 
 import copy
+import re
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -81,6 +82,11 @@ MAX_NEGOTIATE_ROUNDS = 2   # max negotiation passes before forced merge (native 
 DOMAIN_MAX_NEGOTIATE_ROUNDS = 4
 ATFM_DEADLINE_HEADROOM = 8  # minutes of margin to call an ATFM violation
 
+# Matches "TRANSFER AUTH DEADLINE: minute 60" in flight notes (ICU domain).
+_TRANSFER_DEADLINE_RE = re.compile(
+    r"TRANSFER\s+AUTH\s+DEADLINE\s*:\s*MINUTE\s+(\d+)", re.IGNORECASE
+)
+
 
 def diagnostic_is_separation_issue(diagnostic_line: str) -> bool:
     """True for wake/separation violations that force the negotiate round (matches _detect_conflicts)."""
@@ -112,6 +118,9 @@ class EpisodeState:
     round_number:         int = 0
     negotiation_rounds:   int = 0
     episode_id:           int = 0
+    # Set to DOMAIN_MAX_NEGOTIATE_ROUNDS for ICU/ADAPT episodes so that the
+    # LLM sees an accurate steps_remaining rather than going to zero after pass 1.
+    max_negotiate_rounds: int = MAX_NEGOTIATE_ROUNDS
 
 
 class MultiAgentATCEnvironment:
@@ -151,6 +160,7 @@ class MultiAgentATCEnvironment:
         supervisor_profile: Optional[SupervisorProfileName] = None,
         mutated_task: Optional[TaskDefinition] = None,
         randomize: bool = False,
+        domain_mode: bool = False,
     ) -> Tuple[MultiAgentObservation, MultiAgentObservation]:
         """Reset environment. Returns (aman_obs, dman_obs).
 
@@ -159,6 +169,9 @@ class MultiAgentATCEnvironment:
                 parametric perturbations to flight windows and runway weather so
                 agents cannot memorise exact task parameters across episodes.
                 Off by default to keep evaluation and tests deterministic.
+            domain_mode: Set True for ADAPT/ICU domain-transfer episodes.
+                Increases max_negotiate_rounds so agents see a correct
+                steps_remaining value during the extra repair passes.
         """
         if mutated_task is not None:
             task = mutated_task
@@ -172,12 +185,14 @@ class MultiAgentATCEnvironment:
 
         profile = supervisor_profile or self._supervisor.sample_profile(episode_id)
         atfm = self._build_atfm_deadlines(task)
+        max_neg = DOMAIN_MAX_NEGOTIATE_ROUNDS if domain_mode else MAX_NEGOTIATE_ROUNDS
 
         self._state = EpisodeState(
             task=task,
             supervisor_profile=profile,
             atfm_deadlines=atfm,
             episode_id=episode_id,
+            max_negotiate_rounds=max_neg,
         )
         return self._build_observations(RoundType.BID, conflict_log=[], incoming_aman=[], incoming_dman=[])
 
@@ -306,7 +321,9 @@ class MultiAgentATCEnvironment:
             conflict_log=conflict_log,
             round_type=round_type,
             round_number=state.round_number,
-            steps_remaining=MAX_NEGOTIATE_ROUNDS - state.round_number,
+            # Use per-episode cap (DOMAIN_MAX_NEGOTIATE_ROUNDS for ICU) so the LLM
+            # always sees a non-zero steps_remaining while repair passes remain.
+            steps_remaining=max(0, state.max_negotiate_rounds - state.negotiation_rounds),
         )
 
         # Partial observability: ATFM deadlines are DMAN-only information.
@@ -719,19 +736,47 @@ class MultiAgentATCEnvironment:
     # ── ATFM deadline generator ───────────────────────────────────────────────
 
     def _build_atfm_deadlines(self, task: TaskDefinition) -> Dict[str, int]:
-        """Simulate ATFM network slots for departure flights.
+        """Build hard departure deadlines combining explicit note-based constraints
+        (e.g. ICU transfer-auth windows) and randomly-sampled ATFM network slots.
 
-        Real ATFM: ~30% of flights get a constrained slot in peak periods.
-        Deadline = scheduled_minute + small buffer (forces DMAN to prioritise).
+        Priority order:
+          1. Flights whose notes contain "TRANSFER AUTH DEADLINE: minute N" use N
+             (capped to latest_minute) — these are real hard constraints.
+          2. Urgent flights with no explicit minute but tight windows ("MUST VACATE",
+             "URGENT") use latest_minute directly as the deadline.
+          3. Remaining departures: ~1/3 get a random ATFM slot at scheduled + 12 min.
         """
         deadlines: Dict[str, int] = {}
         departures = [f for f in task.flights if f.operation == OperationType.DEPARTURE]
         if not departures:
             return deadlines
-        constrained = self._rng.sample(departures, k=max(1, len(departures) // 3))
-        for flight in constrained:
-            # Deadline = scheduled + 12 min buffer (realistic ATFM GDP window)
-            deadline = flight.scheduled_minute + 12
-            if deadline <= flight.latest_minute:
-                deadlines[flight.flight_id] = deadline
+
+        for flight in departures:
+            note = flight.notes or ""
+            note_up = note.upper()
+
+            # 1. Explicit transfer-auth deadline in notes
+            m = _TRANSFER_DEADLINE_RE.search(note)
+            if m:
+                parsed_dl = int(m.group(1))
+                deadlines[flight.flight_id] = min(parsed_dl, flight.latest_minute)
+                continue
+
+            # 2. Implicit deadline: "must vacate" / "urgent" with a tight window
+            #    (latest - earliest ≤ 20 min).  Use latest_minute so DMAN sorts
+            #    these flights ahead of unconstrained ones.
+            window = flight.latest_minute - flight.earliest_minute
+            if window <= 20 and any(w in note_up for w in ("MUST VACATE", "URGENT")):
+                deadlines[flight.flight_id] = flight.latest_minute
+
+        # 3. Random ATFM slots for flights that don't have explicit deadlines
+        unconstrained = [f for f in departures if f.flight_id not in deadlines]
+        if unconstrained:
+            k = max(1, len(unconstrained) // 3)
+            constrained = self._rng.sample(unconstrained, k=min(k, len(unconstrained)))
+            for flight in constrained:
+                deadline = flight.scheduled_minute + 12
+                if deadline <= flight.latest_minute:
+                    deadlines[flight.flight_id] = deadline
+
         return deadlines

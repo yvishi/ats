@@ -156,14 +156,19 @@ class ATCEnvironment(_EnvBase):
             aman_action, dman_action
         )
         if count_separation_issues(self._env._state.conflict_log) > 0:
-            from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
+            from multi_agent.inference import (
+                _build_aman_heuristic,
+                _build_dman_heuristic,
+                _dman_obs_with_aman_messages,
+            )
 
             atfm = self._env._state.atfm_deadlines
             for _ in range(1, MAX_NEGOTIATE_ROUNDS):
                 if count_separation_issues(self._env._state.conflict_log) == 0:
                     break
                 aman_h = _build_aman_heuristic(aman_obs, separation_repair=1)
-                dman_h = _build_dman_heuristic(dman_obs, atfm, separation_repair=1)
+                dman_obs_m = _dman_obs_with_aman_messages(dman_obs, aman_h)
+                dman_h = _build_dman_heuristic(dman_obs_m, atfm, separation_repair=1)
                 aman_obs, dman_obs, partial_reward, _ = self._env.step_negotiate(
                     aman_h, dman_h
                 )

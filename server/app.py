@@ -253,6 +253,7 @@ async def _sse_episode_gen(
     episode_id: int,
     use_generator: bool,
     use_llm: bool,
+    model_override: Optional[str] = None,
 ) -> AsyncIterator[str]:
     q: queue.Queue = queue.Queue()
 
@@ -273,6 +274,7 @@ async def _sse_episode_gen(
             def sink(ev: Dict[str, Any]) -> None:
                 q.put(("ev", ev))
 
+            effective_model = model_override or MODEL_NAME
             if mode == "domain":
                 run_domain_episode(
                     domain_task_id=task_id,
@@ -280,7 +282,7 @@ async def _sse_episode_gen(
                     env=stream_env,
                     supervisor=supervisor,
                     episode_id=episode_id,
-                    model_name=MODEL_NAME,
+                    model_name=effective_model,
                     visual_sink=sink,
                     visual_profile=visual_profile,
                 )
@@ -293,7 +295,7 @@ async def _sse_episode_gen(
                     supervisor=supervisor,
                     episode_id=episode_id,
                     use_generator=use_generator,
-                    model_name=MODEL_NAME,
+                    model_name=effective_model,
                     visual_sink=sink,
                     visual_profile=visual_profile,
                 )
@@ -325,6 +327,7 @@ async def demo_episode_stream(
     episode_id: int = Query(0, ge=0, le=1_000_000),
     use_generator: bool = Query(True),
     use_llm: bool = Query(False),
+    model: Optional[str] = Query(None, description="HuggingFace model ID override"),
 ) -> StreamingResponse:
     """SSE stream of visual events for one episode (``run_episode`` / ``run_domain_episode``)."""
     _validate_stream_task(mode, task_id)
@@ -340,6 +343,7 @@ async def demo_episode_stream(
             episode_id=episode_id,
             use_generator=use_generator,
             use_llm=use_llm,
+            model_override=model or None,
         ),
         media_type="text/event-stream",
         headers={

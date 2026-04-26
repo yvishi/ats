@@ -1,0 +1,620 @@
+{
+  "episode_id": 0,
+  "domain_task_id": "icu_mass_casualty",
+  "mode": "adapt_domain_transfer",
+  "supervisor_profile": "safety_strict",
+  "adapt_wake_map": {
+    "TRAUMA": "H",
+    "CARDIAC": "M",
+    "POST_OP": "M",
+    "ROUTINE": "L"
+  },
+  "adapt_priority_map": {
+    "TRAUMA": "emergency",
+    "CARDIAC": "medical",
+    "POST_OP": "medical",
+    "ROUTINE": "connection"
+  },
+  "adapt_rationale": "Structural budget-enforced inference (budget: emergency\u22641 heavy\u22641 medical\u22642): TRAUMA: tp=0.98 cr=0.93 score=0.96 \u2192 wake=H priority=emergency; CARDIAC: tp=0.85 cr=0.64 score=0.78 \u2192 wake=M (budget-demoted) priority=medical; POST_OP: tp=0.96 cr=0.00 score=0.58 \u2192 wake=M priority=medical (budget-demoted); ROUTINE: tp=0.68 cr=0.00 score=0.34 \u2192 wake=L priority=connection",
+  "visual_log": [
+    {
+      "type": "adapt_scene",
+      "domain_task_id": "icu_mass_casualty",
+      "visual_profile": "icu",
+      "entity_types": [
+        "CARDIAC",
+        "POST_OP",
+        "ROUTINE",
+        "TRAUMA"
+      ]
+    },
+    {
+      "type": "adapt_mapping",
+      "wake_map": {
+        "TRAUMA": "H",
+        "CARDIAC": "M",
+        "POST_OP": "M",
+        "ROUTINE": "L"
+      },
+      "priority_map": {
+        "TRAUMA": "emergency",
+        "CARDIAC": "medical",
+        "POST_OP": "medical",
+        "ROUTINE": "connection"
+      },
+      "rationale_preview": "Structural budget-enforced inference (budget: emergency\u22641 heavy\u22641 medical\u22642): TRAUMA: tp=0.98 cr=0.93 score=0.96 \u2192 wake=H priority=emergency; CARDIAC: tp=0.85 cr=0.64 score=0.78 \u2192 wake=M (budget-demot"
+    },
+    {
+      "type": "scene_reset",
+      "episode_id": 0,
+      "task_id": "icu_mass_casualty",
+      "resolved_task_id": "icu_mass_casualty",
+      "visual_profile": "icu",
+      "supervisor_profile": "safety_strict",
+      "mutations_applied": [],
+      "task": {
+        "task_id": "icu_mass_casualty",
+        "airport": "GENERAL_HOSPITAL_ICU",
+        "runways": [
+          {
+            "runway_id": "BED_A",
+            "ops": [
+              "arrival",
+              "departure"
+            ]
+          },
+          {
+            "runway_id": "BED_B",
+            "ops": [
+              "arrival",
+              "departure"
+            ]
+          },
+          {
+            "runway_id": "BED_C",
+            "ops": [
+              "arrival",
+              "departure"
+            ]
+          },
+          {
+            "runway_id": "BED_D",
+            "ops": [
+              "arrival",
+              "departure"
+            ]
+          }
+        ],
+        "flights": [
+          {
+            "flight_id": "T_ARR_01",
+            "operation": "arrival",
+            "wake": "H",
+            "scheduled": 5,
+            "earliest": 0,
+            "latest": 10,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "emergency"
+          },
+          {
+            "flight_id": "T_ARR_02",
+            "operation": "arrival",
+            "wake": "H",
+            "scheduled": 8,
+            "earliest": 3,
+            "latest": 15,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "emergency"
+          },
+          {
+            "flight_id": "T_ARR_03",
+            "operation": "arrival",
+            "wake": "H",
+            "scheduled": 12,
+            "earliest": 8,
+            "latest": 20,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "emergency"
+          },
+          {
+            "flight_id": "T_ARR_04",
+            "operation": "arrival",
+            "wake": "M",
+            "scheduled": 30,
+            "earliest": 15,
+            "latest": 75,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_ARR_05",
+            "operation": "arrival",
+            "wake": "M",
+            "scheduled": 50,
+            "earliest": 30,
+            "latest": 100,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_ARR_06",
+            "operation": "arrival",
+            "wake": "M",
+            "scheduled": 80,
+            "earliest": 60,
+            "latest": 140,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_ARR_07",
+            "operation": "arrival",
+            "wake": "M",
+            "scheduled": 110,
+            "earliest": 90,
+            "latest": 170,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_ARR_08",
+            "operation": "arrival",
+            "wake": "L",
+            "scheduled": 120,
+            "earliest": 60,
+            "latest": 240,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "connection"
+          },
+          {
+            "flight_id": "T_ARR_09",
+            "operation": "arrival",
+            "wake": "L",
+            "scheduled": 160,
+            "earliest": 100,
+            "latest": 280,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "connection"
+          },
+          {
+            "flight_id": "T_ARR_10",
+            "operation": "arrival",
+            "wake": "L",
+            "scheduled": 200,
+            "earliest": 150,
+            "latest": 330,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "connection"
+          },
+          {
+            "flight_id": "T_DIS_01",
+            "operation": "departure",
+            "wake": "M",
+            "scheduled": 0,
+            "earliest": 0,
+            "latest": 8,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_DIS_02",
+            "operation": "departure",
+            "wake": "M",
+            "scheduled": 2,
+            "earliest": 0,
+            "latest": 10,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_DIS_03",
+            "operation": "departure",
+            "wake": "M",
+            "scheduled": 5,
+            "earliest": 0,
+            "latest": 15,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_DIS_04",
+            "operation": "departure",
+            "wake": "M",
+            "scheduled": 20,
+            "earliest": 10,
+            "latest": 60,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "medical"
+          },
+          {
+            "flight_id": "T_DIS_05",
+            "operation": "departure",
+            "wake": "L",
+            "scheduled": 40,
+            "earliest": 20,
+            "latest": 120,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "connection"
+          },
+          {
+            "flight_id": "T_DIS_06",
+            "operation": "departure",
+            "wake": "L",
+            "scheduled": 90,
+            "earliest": 60,
+            "latest": 200,
+            "runways": [
+              "BED_A",
+              "BED_B",
+              "BED_C",
+              "BED_D"
+            ],
+            "priority": "connection"
+          }
+        ]
+      }
+    },
+    {
+      "type": "llm_started",
+      "role": "AMAN",
+      "model": "heuristic-baseline"
+    },
+    {
+      "type": "llm_finished",
+      "role": "AMAN",
+      "used_llm": false
+    },
+    {
+      "type": "llm_started",
+      "role": "DMAN",
+      "model": "heuristic-baseline"
+    },
+    {
+      "type": "llm_finished",
+      "role": "DMAN",
+      "used_llm": false
+    },
+    {
+      "type": "action_layout",
+      "phase": "BID",
+      "layout": {
+        "aman_arrivals": [
+          {
+            "flight_id": "T_ARR_01",
+            "runway": "BED_A",
+            "assigned_minute": 5,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_02",
+            "runway": "BED_A",
+            "assigned_minute": 10,
+            "hold_minutes": 2
+          },
+          {
+            "flight_id": "T_ARR_03",
+            "runway": "BED_A",
+            "assigned_minute": 15,
+            "hold_minutes": 3
+          },
+          {
+            "flight_id": "T_ARR_04",
+            "runway": "BED_A",
+            "assigned_minute": 20,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_05",
+            "runway": "BED_A",
+            "assigned_minute": 30,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_06",
+            "runway": "BED_A",
+            "assigned_minute": 60,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_07",
+            "runway": "BED_A",
+            "assigned_minute": 90,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_08",
+            "runway": "BED_A",
+            "assigned_minute": 95,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_09",
+            "runway": "BED_A",
+            "assigned_minute": 100,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_10",
+            "runway": "BED_A",
+            "assigned_minute": 150,
+            "hold_minutes": 0
+          }
+        ],
+        "dman_departures": [
+          {
+            "flight_id": "T_DIS_01",
+            "runway": "BED_A",
+            "assigned_minute": 5,
+            "hold_minutes": 5
+          },
+          {
+            "flight_id": "T_DIS_02",
+            "runway": "BED_B",
+            "assigned_minute": 5,
+            "hold_minutes": 3
+          },
+          {
+            "flight_id": "T_DIS_03",
+            "runway": "BED_C",
+            "assigned_minute": 5,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_DIS_04",
+            "runway": "BED_A",
+            "assigned_minute": 25,
+            "hold_minutes": 5
+          },
+          {
+            "flight_id": "T_DIS_05",
+            "runway": "BED_A",
+            "assigned_minute": 35,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_DIS_06",
+            "runway": "BED_A",
+            "assigned_minute": 65,
+            "hold_minutes": 0
+          }
+        ]
+      }
+    },
+    {
+      "type": "negotiation_tick",
+      "pass": 1,
+      "partial_reward": 0.171,
+      "separation_issues_after": 0,
+      "used_llm": false,
+      "layout": {
+        "aman_arrivals": [
+          {
+            "flight_id": "T_ARR_01",
+            "runway": "BED_D",
+            "assigned_minute": 5,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_02",
+            "runway": "BED_A",
+            "assigned_minute": 10,
+            "hold_minutes": 2
+          },
+          {
+            "flight_id": "T_ARR_03",
+            "runway": "BED_B",
+            "assigned_minute": 10,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_04",
+            "runway": "BED_A",
+            "assigned_minute": 15,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_05",
+            "runway": "BED_A",
+            "assigned_minute": 30,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_06",
+            "runway": "BED_A",
+            "assigned_minute": 60,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_07",
+            "runway": "BED_A",
+            "assigned_minute": 90,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_08",
+            "runway": "BED_A",
+            "assigned_minute": 95,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_09",
+            "runway": "BED_A",
+            "assigned_minute": 100,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_ARR_10",
+            "runway": "BED_A",
+            "assigned_minute": 150,
+            "hold_minutes": 0
+          }
+        ],
+        "dman_departures": [
+          {
+            "flight_id": "T_DIS_01",
+            "runway": "BED_A",
+            "assigned_minute": 5,
+            "hold_minutes": 5
+          },
+          {
+            "flight_id": "T_DIS_02",
+            "runway": "BED_B",
+            "assigned_minute": 5,
+            "hold_minutes": 3
+          },
+          {
+            "flight_id": "T_DIS_03",
+            "runway": "BED_C",
+            "assigned_minute": 5,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_DIS_04",
+            "runway": "BED_A",
+            "assigned_minute": 20,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_DIS_05",
+            "runway": "BED_A",
+            "assigned_minute": 25,
+            "hold_minutes": 0
+          },
+          {
+            "flight_id": "T_DIS_06",
+            "runway": "BED_A",
+            "assigned_minute": 65,
+            "hold_minutes": 0
+          }
+        ]
+      }
+    },
+    {
+      "type": "score_update",
+      "composite": 0.395,
+      "aman_reward": 0.5105,
+      "dman_reward": 0.702
+    },
+    {
+      "type": "terminal",
+      "severity": "degraded",
+      "composite": 0.395,
+      "aman_reward": 0.5105,
+      "dman_reward": 0.702,
+      "coordination": 0.9,
+      "cross_lane_conflicts": 0,
+      "atfm_violations": 0,
+      "negotiation_rounds": 1
+    }
+  ],
+  "rounds": [
+    {
+      "round": "BID",
+      "partial_reward": 0.1583,
+      "separation_issues_detected": 1,
+      "diagnostics_count": 8,
+      "aman_slots": 10,
+      "dman_slots": 6,
+      "aman_messages": 10,
+      "dman_messages": 6,
+      "done": false
+    },
+    {
+      "round": "NEGOTIATE",
+      "negotiate_pass": 1,
+      "partial_reward": 0.171,
+      "separation_issues_before": 1,
+      "separation_issues_after": 0,
+      "diagnostics_count": 8,
+      "conflicts_resolved": 1,
+      "total_messages": 16,
+      "aman_alternatives_offered": 0,
+      "dman_alternatives_offered": 0,
+      "used_llm": false
+    }
+  ],
+  "final": {
+    "composite_score": 0.395,
+    "aman_reward": 0.5105,
+    "dman_reward": 0.702,
+    "coordination_score": 0.9,
+    "cross_lane_conflicts": 0,
+    "negotiation_rounds": 1,
+    "atfm_violations": 0
+  }
+}

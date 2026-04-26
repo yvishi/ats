@@ -1,0 +1,47 @@
+{
+  "episode_id": 0,
+  "task_id": "bengaluru_irrops_hard",
+  "supervisor_profile": "safety_strict",
+  "gen_difficulty": 0,
+  "mutations_applied": [],
+  "solvable": true,
+  "rounds": [
+    {
+      "round": "BID",
+      "partial_reward": 0.1185,
+      "separation_issues_detected": 7,
+      "diagnostics_count": 9,
+      "aman_slots": 8,
+      "dman_slots": 8,
+      "aman_messages": 8,
+      "dman_messages": 8,
+      "done": false
+    },
+    {
+      "round": "NEGOTIATE",
+      "negotiate_pass": 1,
+      "partial_reward": 0.1676,
+      "separation_issues_before": 7,
+      "separation_issues_after": 2,
+      "diagnostics_count": 5,
+      "conflicts_resolved": 5,
+      "total_messages": 16,
+      "aman_alternatives_offered": 0,
+      "dman_alternatives_offered": 0,
+      "used_llm": false
+    }
+  ],
+  "final": {
+    "composite_score": 0.35,
+    "aman_reward": 0.8318,
+    "dman_reward": 0.632,
+    "generator_reward": 0.2681,
+    "supervisor_score": 0.4,
+    "coordination_score": 0.65,
+    "cross_lane_conflicts": 2,
+    "negotiation_rounds": 1,
+    "atfm_violations": 0,
+    "emergency_arrivals_ok": 1,
+    "emergency_departures_ok": 1
+  }
+}
